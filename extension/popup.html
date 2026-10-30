@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>debbie</title>
+<link rel="stylesheet" href="look.css">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<header>
+  <span class="brand"><span id="mark"></span><span class="muted">browser</span></span>
+  <span id="pill" class="pill off">Checking…</span>
+</header>
+<main>
+  <section id="state" class="card" aria-live="polite"></section>
+  <section class="field">
+    <div class="label-row"><label for="name">This browser's name</label><span id="saved" class="saved">Saved</span></div>
+    <input id="name" placeholder="Chrome" maxlength="40" autocomplete="off" spellcheck="false">
+    <p class="hint">debbie shows it when this browser connects.</p>
+  </section>
+  <dl class="facts">
+    <div><dt>Sites</dt><dd id="sites"></dd></div>
+    <div><dt>Screenshots</dt><dd id="shots"></dd></div>
+  </dl>
+</main>
+<footer>
+  <span id="build" class="muted"></span>
+  <button id="options" class="link" type="button">Settings</button>
+</footer>
+<script type="module" src="popup.js"></script>
+</body>
+</html>

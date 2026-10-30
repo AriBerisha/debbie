@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>debbie browser</title>
+<link rel="stylesheet" href="look.css">
+<link rel="stylesheet" href="options.css">
+</head>
+<body>
+<div class="page">
+<header class="top">
+  <div class="brand"><span id="mark"></span><span class="sub">browser extension</span></div>
+  <span id="pill" class="pill off">Checking…</span>
+</header>
+
+<section class="card">
+  <div class="card-head"><h2>Connection</h2></div>
+  <div id="status" class="status" aria-live="polite"></div>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>Sites the agent may open</h2><span id="count" class="muted"></span></div>
+  <p class="note">Only https pages on these sites and their subdomains, in a tab of its own in the debbie tab group, and only while a debbie session has web access on.</p>
+  <ul id="sites" class="sites"></ul>
+  <form id="add" class="add" novalidate>
+    <label class="url"><span class="scheme">https://</span><input id="site" placeholder="example.com" autocomplete="off" spellcheck="false" aria-label="A site to allow" aria-describedby="site-error"></label>
+    <button class="primary">Allow</button>
+  </form>
+  <p id="site-error" class="error" role="alert" hidden></p>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>Screenshots</h2><span id="shots-pill" class="pill off">Checking…</span></div>
+  <p id="shots" class="lead"></p>
+  <p class="note">Chrome lets an extension capture a tab only if it may read every site, which this extension asks for when you load it. The agent still opens, reads and clicks only the sites above: the extension's code refuses every other address.</p>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>This browser's name</h2><span id="saved" class="saved">Saved</span></div>
+  <input id="name" placeholder="Chrome" maxlength="40" autocomplete="off" spellcheck="false" aria-label="This browser's name">
+  <p class="note">debbie shows it when this browser connects, so you know which one the agent uses.</p>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>What the agent does here</h2></div>
+  <ul class="rules">
+    <li><b>Opens only the sites above</b>, over https, in its own tab. It never reads or clicks in your other tabs.</li>
+    <li><b>Asks you first</b> before a click that would buy, subscribe, post, sign in or delete, in every mode.</li>
+    <li><b>Works in your profile</b>, signed in as you: on the allowed sites it reads and clicks as you would.</li>
+    <li><b>Cancels downloads</b> its pages start, and leaves CAPTCHAs to you.</li>
+    <li><b>Makes no network requests of its own</b>: it talks only to debbie, on this computer.</li>
+  </ul>
+</section>
+<footer id="build" class="muted"></footer>
+</div>
+<script type="module" src="options.js"></script>
+</body>
+</html>
