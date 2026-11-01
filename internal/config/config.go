@@ -140,6 +140,10 @@ type Provider struct {
 	// conversation with this provider is summarized to make room; 0 turns
 	// that off, and leaving it out means the config's auto_compact_tokens.
 	AutoCompactTokens *int `json:"auto_compact_tokens,omitempty"`
+	// ReasoningBudgetTokens caps how many tokens the model thinks per
+	// reply, for llama-server (sent as reasoning_budget_tokens); 0 leaves
+	// it to the server.
+	ReasoningBudgetTokens int `json:"reasoning_budget_tokens,omitempty"`
 }
 
 // ProviderOptions tune requests to one provider.
@@ -173,9 +177,8 @@ type Subagents struct {
 
 // Shell configures the shell tool (SPEC §3.5, §8, §21).
 type Shell struct {
-	// Program runs the commands: "auto" (Git Bash when installed, else
-	// Windows PowerShell; sh on Unix), "bash", "sh", "powershell", "pwsh",
-	// "cmd", or a full path.
+	// Program runs the commands: "auto" (Windows PowerShell on Windows;
+	// sh on Unix), "bash", "sh", "powershell", "pwsh", "cmd", or a full path.
 	Program        string   `json:"program,omitempty"`
 	TimeoutSeconds int      `json:"timeout_seconds"`
 	StripEnv       []string `json:"strip_env"`

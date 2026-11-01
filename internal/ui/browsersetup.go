@@ -340,13 +340,20 @@ func siteNames(sites []string) string {
 	return strings.Join(sites, ", ")
 }
 
-// watchChrome flashes when Chrome connects or goes, so the user learns of
-// it with no panel open.
+// watchChrome flashes when Chrome connects or goes, and when it asks the
+// user whether the agent may open a site, so the user learns of it with
+// no panel open.
 func (f *fullscreen) watchChrome() {
 	if f.opts.Web == nil {
 		return
 	}
 	st := f.opts.Web.Bridge.Status()
+	if st.Asking != f.chromeAsking {
+		f.chromeAsking = st.Asking
+		if st.Asking != "" {
+			f.flash(st.Extension.Label() + " is asking you whether the agent may open " + st.Asking + ": answer in the window it opened")
+		}
+	}
 	now := st.Connected && st.Extension.Version != ""
 	switch {
 	case now == f.chromeShown:

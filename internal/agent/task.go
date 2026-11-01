@@ -306,12 +306,12 @@ func (t *TaskTool) run(ctx context.Context, desc, task string, full bool) (tools
 }
 
 // session makes the subagent's session: the parent's provider, output
-// limit, mode, effort and session approvals, unless subagents have a
-// provider of their own; and the tools its kind allows.
+// limit, mode, effort, reasoning budget and session approvals, unless
+// subagents have a provider of their own; and the tools its kind allows.
 func (t *TaskTool) session(full bool) (*Session, error) {
 	p := t.parent
 	p.mu.Lock()
-	prov, maxTokens, mode, level, web, tainted := p.provider, p.maxTokens, p.mode, p.effort, p.web, p.tainted
+	prov, maxTokens, mode, level, budget, web, tainted := p.provider, p.maxTokens, p.mode, p.effort, p.budget, p.web, p.tainted
 	p.mu.Unlock()
 	if t.provider != nil {
 		var err error
@@ -320,7 +320,7 @@ func (t *TaskTool) session(full bool) (*Session, error) {
 		}
 	}
 	sub := New(prov, t.system(full), maxTokens)
-	sub.mode, sub.effort, sub.redact, sub.maxTurns = mode, level, p.redact, t.maxTurns
+	sub.mode, sub.effort, sub.budget, sub.redact, sub.maxTurns = mode, level, budget, p.redact, t.maxTurns
 	sub.ledger = p.ledger // its spend is the session's
 	// Its task may carry what a page said: the parent's taint goes along.
 	sub.web, sub.tainted = web, tainted

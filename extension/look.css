@@ -55,6 +55,9 @@
   }
 }
 *, *::before, *::after { box-sizing: border-box; }
+/* The hidden attribute wins over a display rule of a class, such as the
+   grid of a page's main or the flex of a row. */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: radial-gradient(600px 320px at 12% -10%, var(--bg-glow), transparent 65%) no-repeat, var(--bg);

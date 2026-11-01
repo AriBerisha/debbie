@@ -37,6 +37,33 @@ export function allowedSite(host, sites) {
   return sites.find((s) => host === s || host.endsWith("." + s)) || "";
 }
 
+// baseSite returns the site that covers all of a host's domain:
+// example.com for docs.example.com, bbc.co.uk for news.bbc.co.uk. Without
+// the public suffix list it is a guess: the last two labels, or three when
+// the second is a registry's name under a country code.
+export function baseSite(host) {
+  const labels = String(host).toLowerCase().split(".");
+  if (labels.length <= 2) return labels.join(".");
+  const [sld, tld] = labels.slice(-2);
+  const n = tld.length === 2 && /^(ac|co|com|edu|gov|go|gob|ltd|me|mil|ne|net|nom|or|org|plc)$/.test(sld) ? 3 : 2;
+  return labels.slice(-n).join(".");
+}
+
+// unlistedSite returns the site that url needs on the list to open, which
+// the extension asks the user to add (SPEC §20.0): "" when the URL opens
+// already, or is refused for a reason no list changes.
+export function unlistedSite(url, sites) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return "";
+  }
+  const site = siteOf(u.hostname);
+  if (!site || allowedSite(u.hostname, sites)) return "";
+  return checkURL(url, [...sites, site]) ? "" : site;
+}
+
 // checkURL says why the agent may not open url; "" when it may.
 export function checkURL(url, sites) {
   let u;

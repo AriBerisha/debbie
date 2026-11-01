@@ -84,17 +84,6 @@ func ParseTokens(s string) (int, bool) {
 	case "off", "0", "none", "never":
 		return 0, true
 	}
-	mult := 1.0
-	switch {
-	case strings.HasSuffix(s, "k"):
-		mult, s = 1000, strings.TrimSuffix(s, "k")
-	case strings.HasSuffix(s, "m"):
-		mult, s = 1_000_000, strings.TrimSuffix(s, "m")
-	}
-	var f float64
-	if _, err := fmt.Sscan(s, &f); err != nil || f <= 0 {
-		return 0, false
-	}
-	n := int(f * mult)
-	return n, n >= config.MinAutoCompactTokens
+	n, ok := parseCount(s)
+	return n, ok && n >= config.MinAutoCompactTokens
 }

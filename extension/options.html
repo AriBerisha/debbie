@@ -20,9 +20,10 @@
 </section>
 
 <section class="card">
-  <div class="card-head"><h2>Sites the agent may open</h2><span id="count" class="muted"></span></div>
-  <p class="note">Only https pages on these sites and their subdomains, in a tab of its own in the debbie tab group, and only while a debbie session has web access on.</p>
+  <div class="card-head"><h2>Sites the agent may open</h2><span class="head-end"><span id="count" class="muted"></span><button id="remove-all" class="remove" type="button" hidden>Remove all</button></span></div>
+  <p class="note">Only https pages on these sites and their subdomains, in a tab of its own in the debbie tab group, and only while a debbie session has web access on. When the agent asks for a page on another site, a window asks you whether to allow it.</p>
   <ul id="sites" class="sites"></ul>
+  <p id="remove-all-confirm" class="confirm" hidden><span>Remove all of them (<span id="remove-all-count"></span>)? The agent then can't open any page until you allow a site again.</span><span class="confirm-buttons"><button id="remove-all-yes" class="danger" type="button">Remove all</button><button id="remove-all-no" class="ghost" type="button">Keep them</button></span></p>
   <form id="add" class="add" novalidate>
     <label class="url"><span class="scheme">https://</span><input id="site" placeholder="example.com" autocomplete="off" spellcheck="false" aria-label="A site to allow" aria-describedby="site-error"></label>
     <button class="primary">Allow</button>

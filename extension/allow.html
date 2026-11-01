@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>debbie asks</title>
+<link rel="stylesheet" href="look.css">
+<link rel="stylesheet" href="allow.css">
+</head>
+<body>
+<main id="ask" class="ask" hidden>
+  <header class="top"><span id="mark"></span><span class="muted">asks you</span></header>
+  <h1>May the agent open <span id="site" class="site"></span>?</h1>
+  <p class="url"><code id="url"></code></p>
+  <p id="who" class="who"></p>
+  <label id="wider-row" class="wider" hidden><input id="wider" type="checkbox"><span>Allow all of <b id="wider-site"></b>, not only this part of it</span></label>
+  <p class="note">Allowing a site adds it, with its subdomains, to the extension's list: the agent may open, read and click pages there from now on. The extension's settings remove it again.</p>
+  <p id="error" class="error" role="alert" hidden></p>
+  <div class="buttons">
+    <button id="no" class="ghost" type="button">Don't allow</button>
+    <button id="yes" class="primary" type="button">Allow <span id="yes-site"></span></button>
+  </div>
+</main>
+<main id="gone" class="ask" hidden>
+  <header class="top"><span id="mark-gone"></span></header>
+  <p>This question was answered already, or debbie moved on.</p>
+  <div class="buttons"><button id="close" class="ghost" type="button">Close</button></div>
+</main>
+<script type="module" src="allow.js"></script>
+</body>
+</html>

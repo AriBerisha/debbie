@@ -44,15 +44,11 @@ const (
 )
 
 // FindShell picks the program that runs commands, from the config's
-// shell.program: "" or "auto" for Git Bash when Git for Windows is
-// installed and Windows PowerShell otherwise; "bash", "powershell",
+// shell.program: "" or "auto" for Windows PowerShell; "bash", "powershell",
 // "pwsh" or "cmd"; or the full path of one of those programs.
 func FindShell(program string) (*Shell, error) {
 	switch strings.ToLower(program) {
 	case "", "auto":
-		if p := gitBash(); p != "" {
-			return &Shell{Path: p, Kind: "bash", Name: "Git Bash"}, nil
-		}
 		return windowsPowerShell(), nil
 	case "bash":
 		if p := gitBash(); p != "" {

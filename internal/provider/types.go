@@ -100,6 +100,10 @@ type Request struct {
 	MaxTokens   int          // 0 leaves the limit to the server
 	Temperature *float64     // nil leaves it to the server
 	Effort      effort.Level // effort.Default leaves it to the server
+	// ReasoningBudget caps the tokens the model thinks per reply; 0 leaves
+	// it to the server. llama-server takes it (SPEC §4.3); other servers
+	// would ignore or refuse it, so it is sent only when set.
+	ReasoningBudget int
 }
 
 // TextMessage returns a message holding one text part.

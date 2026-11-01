@@ -23,11 +23,15 @@ import (
 // host and the extension (SPEC §20.3).
 const protocolVersion = 1
 
-// Call timeouts (SPEC §20.3).
-const (
+// Call timeouts (SPEC §20.3). Variables, so tests can shorten them.
+var (
 	callTimeout     = 30 * time.Second
 	navigateTimeout = 60 * time.Second
 	helloTimeout    = 5 * time.Second
+	// askTimeout is the wait once the extension says it is asking the user
+	// whether the agent may open a site (SPEC §20.0): the extension gives
+	// them two minutes, and this is the fallback.
+	askTimeout = 150 * time.Second
 )
 
 // maxSocketPath is the size of a Unix socket address's path, with its
@@ -73,9 +77,16 @@ type Bridge struct {
 	ln      net.Listener
 	token   string
 	host    *hostConn // the host connected now; nil for none
-	pending map[int64]chan reply
+	pending map[int64]*pendingCall
 	nextID  int64
 	ext     Extension // what the extension said when it connected
+	asking  string    // the site the extension is asking the user about; "" for none
+}
+
+// pendingCall is a call the extension hasn't answered.
+type pendingCall struct {
+	ch     chan reply
+	asking chan string // the site the extension asks the user about, which lengthens the wait
 }
 
 // Extension describes the connected extension.
@@ -110,7 +121,7 @@ type reply struct {
 
 // NewBridge returns a bridge in dir for a session in workspace.
 func NewBridge(dir, workspace string) *Bridge {
-	return &Bridge{dir: dir, workspace: workspace, pending: map[int64]chan reply{}}
+	return &Bridge{dir: dir, workspace: workspace, pending: map[int64]*pendingCall{}}
 }
 
 // Start takes the browser for this session, unless another session holds
@@ -187,12 +198,16 @@ type Status struct {
 	Connected bool
 	Extension Extension
 	Socket    string
+	// Asking is the site the extension is asking the user about, in a
+	// window of Chrome's, while a call waits for the answer (SPEC §20.0);
+	// "" when none is.
+	Asking string
 }
 
 func (b *Bridge) Status() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return Status{Started: b.ln != nil, Connected: b.host != nil, Extension: b.ext, Socket: filepath.Join(b.dir, socketFile)}
+	return Status{Started: b.ln != nil, Connected: b.host != nil, Extension: b.ext, Socket: filepath.Join(b.dir, socketFile), Asking: b.asking}
 }
 
 // accept takes connections from hosts until the listener closes.
@@ -286,7 +301,10 @@ type message struct {
 	Result json.RawMessage `json:"result"`
 	Error  *string         `json:"error"`
 	Event  string          `json:"event"`
-	Name   string          `json:"name"` // of the "name" event: the browser's new name
+	Name   string          `json:"name"`  // of the "name" event: the browser's new name
+	Sites  []string        `json:"sites"` // of the "sites" event: the sites allowed now
+	Call   *int64          `json:"call"`  // of the "asking" event: the call it is for
+	Site   string          `json:"site"`  // of the "asking" event: the site asked about
 }
 
 // read takes the extension's messages until the host goes.
@@ -302,18 +320,14 @@ func (b *Bridge) read(hc *hostConn) {
 			continue
 		}
 		if m.ID == nil {
-			if m.Event == "name" { // the user renamed the browser in the popup
-				b.mu.Lock()
-				b.ext.Name = m.Name
-				b.mu.Unlock()
-			}
+			b.event(m)
 			continue
 		}
 		b.mu.Lock()
-		ch := b.pending[*m.ID]
+		c := b.pending[*m.ID]
 		delete(b.pending, *m.ID)
 		b.mu.Unlock()
-		if ch == nil {
+		if c == nil {
 			continue // its caller gave up
 		}
 		r := reply{result: m.Result}
@@ -322,7 +336,33 @@ func (b *Bridge) read(hc *hostConn) {
 		} else if len(bytes.TrimSpace(m.Result)) == 0 {
 			r.result = json.RawMessage("null")
 		}
-		ch <- r
+		c.ch <- r
+	}
+}
+
+// event takes what the extension says of its own accord: the user renamed
+// the browser in the popup, the sites changed (the options page, or an
+// answer to the window that asks about a site), or the extension is
+// asking the user whether the agent may open a site, which lengthens the
+// wait of the call it is for.
+func (b *Bridge) event(m message) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch m.Event {
+	case "name":
+		b.ext.Name = m.Name
+	case "sites":
+		b.ext.Sites = m.Sites
+	case "asking":
+		if m.Call == nil || m.Site == "" {
+			return
+		}
+		if c := b.pending[*m.Call]; c != nil {
+			select {
+			case c.asking <- m.Site:
+			default:
+			}
+		}
 	}
 }
 
@@ -335,14 +375,17 @@ func (b *Bridge) drop(hc *hostConn) {
 		return
 	}
 	b.host, b.ext = nil, Extension{}
-	for id, ch := range b.pending {
-		ch <- reply{err: "the browser disconnected"}
+	for id, c := range b.pending {
+		c.ch <- reply{err: "the browser disconnected"}
 		delete(b.pending, id)
 	}
 }
 
 // Call asks the extension to do something and waits for its answer: 30
-// seconds at most, or 60 for a navigation.
+// seconds at most, or 60 for a navigation, or 150 once the extension says
+// it is asking the user whether the agent may open a site. A call given
+// up on, for the context or the time, is cancelled in the extension, which
+// closes the window asking about a site.
 func (b *Bridge) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	b.mu.Lock()
 	hc := b.host
@@ -356,25 +399,36 @@ func (b *Bridge) Call(ctx context.Context, method string, params any) (json.RawM
 	}
 	b.nextID++
 	id := b.nextID
-	ch := make(chan reply, 1)
-	b.pending[id] = ch
+	c := &pendingCall{ch: make(chan reply, 1), asking: make(chan string, 1)}
+	b.pending[id] = c
 	b.mu.Unlock()
-	forget := func() {
+	asked := ""
+	done := func() {
 		b.mu.Lock()
 		delete(b.pending, id)
+		if asked != "" {
+			b.asking = ""
+		}
 		b.mu.Unlock()
+	}
+	giveUp := func() {
+		done()
+		data, _ := json.Marshal(map[string]any{"v": protocolVersion, "event": "cancel", "call": id})
+		hc.writeMu.Lock()
+		writeFrame(hc.conn, data, maxToChrome)
+		hc.writeMu.Unlock()
 	}
 
 	data, err := json.Marshal(map[string]any{"v": protocolVersion, "id": id, "method": method, "params": params})
 	if err != nil {
-		forget()
+		done()
 		return nil, err
 	}
 	hc.writeMu.Lock()
 	err = writeFrame(hc.conn, data, maxToChrome)
 	hc.writeMu.Unlock()
 	if err != nil {
-		forget()
+		done()
 		return nil, fmt.Errorf("sending to the browser: %w", err)
 	}
 	timeout := callTimeout
@@ -383,18 +437,34 @@ func (b *Bridge) Call(ctx context.Context, method string, params any) (json.RawM
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case r := <-ch:
-		if r.err != "" {
-			return nil, errors.New(r.err)
+	for {
+		select {
+		case r := <-c.ch:
+			done()
+			if r.err != "" {
+				return nil, errors.New(r.err)
+			}
+			return r.result, nil
+		case site := <-c.asking:
+			// The user has the extension's two minutes to answer.
+			asked, timeout = site, askTimeout
+			b.mu.Lock()
+			b.asking = site
+			b.mu.Unlock()
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(timeout)
+		case <-ctx.Done():
+			giveUp()
+			return nil, ctx.Err()
+		case <-timer.C:
+			giveUp()
+			if asked != "" {
+				return nil, fmt.Errorf("refused: nobody answered, within %s, whether the agent may open %s", timeout, asked)
+			}
+			return nil, fmt.Errorf("the browser didn't answer within %s", timeout)
 		}
-		return r.result, nil
-	case <-ctx.Done():
-		forget()
-		return nil, ctx.Err()
-	case <-timer.C:
-		forget()
-		return nil, fmt.Errorf("the browser didn't answer within %s", timeout)
 	}
 }
 

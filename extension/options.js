@@ -74,7 +74,11 @@ async function show() {
     items.push(none);
   }
   document.getElementById("sites").replaceChildren(...items);
-  document.getElementById("count").textContent = list.length === 1 ? "1 site" : `${list.length} sites`;
+  const count = list.length === 1 ? "1 site" : `${list.length} sites`;
+  document.getElementById("count").textContent = count;
+  document.getElementById("remove-all-count").textContent = count;
+  document.getElementById("remove-all").hidden = list.length === 0;
+  if (list.length === 0) confirmRemoveAll.hidden = true;
 
   pill(document.getElementById("pill"), ...PILLS[c.state]);
   document.getElementById("status").replaceChildren(...statusParts(c));
@@ -114,6 +118,24 @@ document.getElementById("add").onsubmit = async (event) => {
   if (!list.includes(site)) await chrome.storage.local.set({ sites: [...list, site] });
   input.value = "";
   problem("");
+  show();
+};
+
+// Remove all empties the list, after a confirmation in the page. Access to
+// every site stays granted, as above; the empty list decides.
+const confirmRemoveAll = document.getElementById("remove-all-confirm");
+document.getElementById("remove-all").onclick = () => {
+  confirmRemoveAll.hidden = false;
+  document.getElementById("remove-all-no").focus();
+};
+document.getElementById("remove-all-no").onclick = () => {
+  confirmRemoveAll.hidden = true;
+};
+document.getElementById("remove-all-yes").onclick = async () => {
+  const list = await sites();
+  await chrome.storage.local.set({ sites: [] });
+  for (const site of list) await chrome.permissions.remove({ origins: originsFor(site) }).catch(() => {});
+  confirmRemoveAll.hidden = true;
   show();
 };
 

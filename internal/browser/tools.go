@@ -227,6 +227,18 @@ func underDomain(host, domain string) bool {
 	return domain != "" && (host == domain || strings.HasSuffix(host, "."+domain))
 }
 
+// onSites reports whether host is one of the extension's sites or under
+// one, as the extension judges it (rules.js, allowedSite).
+func onSites(host string, sites []string) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	for _, s := range sites {
+		if host == s || strings.HasSuffix(host, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
 // siteOf is what "this site for the session" covers: the host without a
 // leading "www.".
 func siteOf(host string) string {
@@ -264,6 +276,11 @@ func (t Navigate) Prepare(_ context.Context, _ *tools.Env, args tools.Args) (*to
 	allowed := false
 	for _, d := range t.a.Web().AllowDomains {
 		allowed = allowed || underDomain(strings.ToLower(u.Hostname()), d)
+	}
+	if st := t.a.Bridge.Status(); st.Connected && st.Extension.Version != "" && !onSites(u.Hostname(), st.Extension.Sites) {
+		// The extension will ask the user to add the site (SPEC §20.0): the
+		// approval prompt, where there is one, says so.
+		call.Preview += "\n" + site + " isn't one of the sites the extension allows yet: Chrome will ask you whether to add it."
 	}
 	switch {
 	case config.LooksLikeToken(raw):

@@ -46,6 +46,21 @@ h2 { font-size: 15.5px; }
 .sites .none { color: var(--muted); }
 button.remove { background: transparent; color: var(--muted); border-color: var(--line); padding: 4px 10px; font-size: 13px; }
 button.remove:hover { color: var(--danger); border-color: var(--danger); }
+.head-end { display: flex; align-items: center; gap: 10px; }
+.confirm {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 10px;
+  font-size: 13.5px;
+}
+.confirm-buttons { display: flex; gap: 8px; flex: none; }
+button.danger { background: var(--danger); color: #fff; }
+button.danger:hover { filter: brightness(1.1); }
 
 .add { display: flex; gap: 8px; }
 .url {

@@ -283,6 +283,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	session.SetRedactor(redactor.String)
 	level, _ := effort.Parse(conn.Provider.ReasoningEffort) // validated with the config
 	session.SetEffort(level)
+	session.SetReasoningBudget(conn.Provider.ReasoningBudgetTokens)
 	session.SetMode(mode)
 	if cfg.MaxTurns > 0 {
 		session.SetMaxTurns(cfg.MaxTurns)
@@ -375,6 +376,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		session.SetMaxTokens(p.MaxOutputTokens)
 		level, _ := effort.Parse(p.ReasoningEffort)
 		session.SetEffort(level)
+		session.SetReasoningBudget(p.ReasoningBudgetTokens)
 		if access != nil {
 			access.Refresh() // screenshots for a model that sees images
 		}

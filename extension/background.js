@@ -2,12 +2,14 @@
 // debbie's host, which relays the requests of the session that has
 // web access on, and does what they ask in the agent's tab, only on the
 // sites the user allows (rules.js): open a page, read it, take a
-// screenshot, click, hover, scroll. The agent's tab sits in the user's
-// window, in a tab group whose title shows whether the agent is at work,
-// and while it is, a glow runs around the page. The extension makes no
-// network requests of its own: pages load because the agent opened them,
-// and downloads they start are cancelled.
-import { DEFAULT_SITES, checkURL, confirmReason } from "./rules.js";
+// screenshot, click, hover, scroll. A page on a site that isn't on the
+// list opens a small window that asks the user whether to allow the site,
+// and a yes adds it. The agent's tab sits in the user's window, in a tab
+// group whose title shows whether the agent is at work, and while it is,
+// a glow runs around the page. The extension makes no network requests of
+// its own: pages load because the agent opened them, and downloads they
+// start are cancelled.
+import { DEFAULT_SITES, baseSite, checkURL, confirmReason, unlistedSite } from "./rules.js";
 
 const HOST = "debbie";
 const MAX_TEXT = 100000; // characters of a page's text the agent gets
@@ -16,6 +18,8 @@ const LOAD_TIMEOUT = 60000;
 const SETTLE = 1500; // after a page loads, for its scripts to fill it in
 const SHOT_WIDTH = 1280; // the widest a screenshot is sent
 const IDLE_AFTER = 4000; // the agent counts as at work this long after it acted
+const ASK_TIMEOUT = 120000; // for the user to say whether a site may be added
+const ASK_WINDOW = { width: 470, height: 440 }; // the window that asks
 
 // The agent's tab group: its title says whether the agent is at work.
 const GROUP_BUSY = { title: "🟢 debbie", color: "cyan" };
@@ -30,6 +34,10 @@ let lastShot = null; // the latest screenshot's page and scale, for clicks by po
 let idleTimer = null;
 let working = false; // the agent is at work, as the group's title says
 let connected = false; // a session is connected
+let session = null; // the session connected: { workspace, pid }
+const asks = new Map(); // the user's pending answers about sites, by ask ID
+let nextAsk = 1;
+const declined = new Set(); // sites the user didn't allow this session: not asked about again
 
 // The toolbar icon: teal while a session is connected, gray when not; a
 // dot on it while the agent is at work.
@@ -76,8 +84,10 @@ function connect() {
 
 // showSession records which session is connected, for the popup and the
 // options page, and shows it on the toolbar. When the session goes, the
-// agent's tab leaves its group, which then disappears.
-function showSession(session, hostError = "") {
+// agent's tab leaves its group, which then disappears, the questions it
+// asked close, and the sites it was refused may be asked about again.
+function showSession(connectedSession, hostError = "") {
+  session = connectedSession;
   chrome.storage.session.set({ session, hostError });
   connected = Boolean(session);
   showToolbar();
@@ -89,6 +99,8 @@ function showSession(session, hostError = "") {
       chrome.tabs.ungroup(agentTab).catch(() => {});
     }
     agentGroup = null;
+    for (const ask of asks.values()) ask.settle("cancel");
+    declined.clear();
   }
 }
 
@@ -97,10 +109,16 @@ async function onMessage(msg) {
     showSession(msg.connected ? { workspace: msg.workspace, pid: msg.pid } : null);
     return;
   }
+  if (msg.event === "cancel") {
+    // The session gave up on a call, as when the user pressed Ctrl+C
+    // while Chrome asked them about a site.
+    for (const ask of asks.values()) if (ask.call === msg.call) ask.settle("cancel");
+    return;
+  }
   if (msg.id === undefined) return;
   await busy();
   try {
-    const result = await handle(msg.method, msg.params || {});
+    const result = await handle(msg.method, msg.params || {}, msg.id);
     port?.postMessage({ id: msg.id, result });
   } catch (e) {
     port?.postMessage({ id: msg.id, error: String((e && e.message) || e) });
@@ -110,7 +128,7 @@ async function onMessage(msg) {
   }
 }
 
-async function handle(method, params) {
+async function handle(method, params, call) {
   switch (method) {
     case "hello": {
       // The build is the manifest's version_name, which the install sets:
@@ -119,7 +137,7 @@ async function handle(method, params) {
       return { version: manifest.version, build: manifest.version_name || "", sites: await sites(), name: await browserName() };
     }
     case "navigate":
-      return navigate(String(params.url || ""));
+      return navigate(String(params.url || ""), call);
     case "read":
       return read(["links", "interactive"].includes(params.mode) ? params.mode : "text");
     case "screenshot":
@@ -127,13 +145,92 @@ async function handle(method, params) {
     case "describe":
       return describeTarget(params);
     case "click":
-      return click(params);
+      return click(params, call);
     case "hover":
       return hover(params);
     case "scroll":
       return scroll(String(params.direction || "down"));
   }
   throw new Error(`unknown method ${method}`);
+}
+
+// allowed returns the sites the agent may open url on, asking the user
+// first when its site isn't on the list (SPEC §20.0): a small window asks
+// whether to allow the site, and yes adds it, with its subdomains, to the
+// list the options page shows. No refuses, and the site isn't asked
+// about again while this session lasts; a window closed or left
+// unanswered refuses this once. Anything the list can't change (plain
+// http, a local address) is refused outright. call is the session's call
+// this is for, which it may cancel.
+async function allowed(url, call) {
+  const list = await sites();
+  const problem = checkURL(url, list);
+  if (!problem) return list;
+  const site = unlistedSite(url, list);
+  if (!site) throw new Error("refused: " + problem);
+  if (declined.has(site)) {
+    throw new Error(`refused: you didn't allow ${site} when Chrome asked, so the agent doesn't open it this session; the extension's options add sites`);
+  }
+  const answer = await askUser({ site, url, call });
+  switch (answer) {
+    case "no":
+      declined.add(site);
+      throw new Error(`refused: you didn't allow ${site} when Chrome asked, so the agent doesn't open it this session`);
+    case "closed":
+      throw new Error(`refused: the window asking whether the agent may open ${site} was closed without an answer`);
+    case "timeout":
+      throw new Error(`refused: nobody answered, within two minutes, whether the agent may open ${site}`);
+    case "cancel":
+      throw new Error("the call was cancelled while Chrome asked about " + site);
+  }
+  // The user allowed answer: the site itself, or all of its domain.
+  const now = await sites();
+  if (!now.includes(answer)) await chrome.storage.local.set({ sites: [...now, answer] });
+  return sites();
+}
+
+// askUser opens the window that asks about a site, and resolves to the
+// site the user allowed, or to why they didn't: "no", "closed", "timeout"
+// or "cancel". The session hears that the question is being asked, so it
+// waits longer than for a page, and shows it.
+function askUser(ask) {
+  return new Promise((resolve) => {
+    const id = String(nextAsk++);
+    const entry = { ...ask, id, window: null, timer: null };
+    entry.settle = (answer) => {
+      if (!asks.delete(id)) return;
+      clearTimeout(entry.timer);
+      if (entry.window !== null) chrome.windows.remove(entry.window).catch(() => {});
+      resolve(answer);
+    };
+    asks.set(id, entry);
+    entry.timer = setTimeout(() => entry.settle("timeout"), ASK_TIMEOUT);
+    port?.postMessage({ event: "asking", call: ask.call, site: ask.site, url: ask.url });
+    chrome.windows.create({ url: chrome.runtime.getURL("allow.html?ask=" + id), type: "popup", focused: true, ...ASK_WINDOW }).then((w) => {
+      entry.window = w.id;
+      if (!asks.has(id)) chrome.windows.remove(w.id).catch(() => {}); // answered before it opened
+    }, () => entry.settle("closed"));
+  });
+}
+
+// askAnswer takes the allow page's messages: what to ask about, and the
+// user's answer. The site allowed can only be the one asked about or all
+// of its domain.
+function askAnswer(msg) {
+  if (msg.ask !== undefined) {
+    const ask = asks.get(String(msg.ask));
+    if (!ask) return null;
+    const wider = baseSite(ask.site);
+    return { site: ask.site, url: ask.url, wider: wider !== ask.site ? wider : "", session };
+  }
+  const ask = asks.get(String(msg.answer));
+  if (!ask) return false;
+  if (msg.site && [ask.site, baseSite(ask.site)].includes(msg.site)) {
+    ask.settle(msg.site);
+  } else {
+    ask.settle("no");
+  }
+  return true;
 }
 
 // busy shows that the agent is at work: the group's title, and the glow
@@ -200,10 +297,8 @@ async function agentOn() {
   return tab;
 }
 
-async function navigate(url) {
-  const allowed = await sites();
-  const problem = checkURL(url, allowed);
-  if (problem) throw new Error("refused: " + problem);
+async function navigate(url, call) {
+  const list = await allowed(url, call);
   if (pending) throw new Error("another page is still loading");
   let tab = await agent();
   const wait = loaded(tab ? tab.id : null);
@@ -226,7 +321,7 @@ async function navigate(url) {
   await settled(tab.id);
   tab = (await agent()) || tab;
   // Without host permission for where it ended up, Chrome hides the URL.
-  if (!tab.url || checkURL(tab.url, allowed)) return { url: null, title: null };
+  if (!tab.url || checkURL(tab.url, list)) return { url: null, title: null };
   agentURL = tab.url;
   inPage(tab.id, "glow", true).catch(() => {});
   return { url: tab.url, title: tab.title };
@@ -330,12 +425,13 @@ async function describeTarget(params) {
 }
 
 // click clicks an element, after the checks the extension makes whatever
-// the CLI asked: never a CAPTCHA, never a link off the allowed sites, and
-// an action the user always confirms only once they did. A click that
-// leads off the allowed sites is undone.
-async function click(params) {
+// the CLI asked: never a CAPTCHA, never a link off the allowed sites
+// (unless the user allows the site when asked), and an action the user
+// always confirms only once they did. A click that leads off the allowed
+// sites is undone.
+async function click(params, call) {
   const tab = await agentOn();
-  const allowed = await sites();
+  let list = await sites();
   const target = pointAt(tab, params);
   const el = await inPage(tab.id, "describe", target);
   if (el.captcha) throw new Error("refused: it is part of a CAPTCHA, which the agent never touches; the user can solve it");
@@ -343,11 +439,14 @@ async function click(params) {
   const reason = confirmReason(el);
   if (reason && !params.confirmed) throw new Error(`refused: clicking it would ${reason}, which needs the user's confirmation`);
   if (el.href && el.role === "link") {
-    const problem = checkURL(el.href, allowed);
-    if (problem) throw new Error("refused: the link goes to " + el.href + ": " + problem);
+    try {
+      list = await allowed(el.href, call);
+    } catch (e) {
+      throw new Error("refused: the link goes to " + el.href + ": " + String((e && e.message) || e).replace(/^refused: /, ""));
+    }
     if (el.target && el.target !== "_self") {
       // It would open a tab of the user's: the agent's tab goes instead.
-      const page = await navigate(el.href);
+      const page = await navigate(el.href, call);
       return { ...page, navigated: true, element: el };
     }
   }
@@ -355,7 +454,7 @@ async function click(params) {
   await inPage(tab.id, "click", target);
   await settle(tab.id);
   const after = await agent();
-  if (!after || !after.url || checkURL(after.url, allowed)) {
+  if (!after || !after.url || checkURL(after.url, list)) {
     await chrome.tabs.goBack(tab.id).catch(() => {});
     throw new Error("refused: the click led off the allowed sites, so the agent's tab went back");
   }
@@ -450,12 +549,16 @@ chrome.tabs.onRemoved.addListener((id) => {
     agentURL = "";
   }
 });
-// The browser's name, from the popup, goes to the session at once.
+// The browser's name, from the popup, and the sites, from the options page
+// or an answer to the window that asks, go to the session at once.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.name) port?.postMessage({ event: "name", name: changes.name.newValue || "" });
+  if (area !== "local") return;
+  if (changes.name) port?.postMessage({ event: "name", name: changes.name.newValue || "" });
+  if (changes.sites) port?.postMessage({ event: "sites", sites: changes.sites.newValue || [] });
 });
-// The popup and the options page ask how things stand, and the popup can
-// bring the agent's tab to the front.
+// The popup and the options page ask how things stand, the popup can
+// bring the agent's tab to the front, and the window that asks about a
+// site learns what to ask and brings the answer.
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg === "status") reply({ connected: port !== null, working, agentTab: agentTab !== null });
   if (msg === "showAgentTab" && agentTab !== null) {
@@ -464,6 +567,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
       chrome.windows.update(tab.windowId, { focused: true });
     }).catch(() => {});
     reply(true);
+  }
+  if (msg && typeof msg === "object" && (msg.ask !== undefined || msg.answer !== undefined)) reply(askAnswer(msg));
+});
+// A window that asked about a site and was closed answers nothing.
+chrome.windows.onRemoved.addListener((windowId) => {
+  for (const ask of asks.values()) {
+    if (ask.window === windowId) {
+      ask.window = null;
+      ask.settle("closed");
+    }
   }
 });
 // These start the worker when Chrome starts and when the extension is

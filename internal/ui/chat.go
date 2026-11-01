@@ -344,6 +344,12 @@ func (c *chat) command(cmd string) (quit bool) {
 		c.r.println(c.st.gray("Conversation cleared."))
 	case "/effort":
 		return c.effortCommand(arg)
+	case "/budget":
+		if msg, ok := reasoningBudget(&c.opts, arg); ok {
+			c.r.println(msg)
+		} else {
+			c.r.println(c.st.yellow(msg))
+		}
 	case "/compact":
 		c.compactCommand(arg)
 	case "/goal":
@@ -415,6 +421,7 @@ func (c *chat) command(cmd string) (quit bool) {
 			"/compact [focus]  summarize the conversation to free context",
 			"/autocompact [n]  when it is compacted by itself: tokens, on or off",
 			"/effort [level]   how hard the model reasons: pick on a slider, or give " + effortChoices(c.opts.EffortLevels),
+			"/budget [tokens]  cap how long the model thinks per reply (llama-server): 16k, or auto",
 			"/goal [condition] keep working until a condition is met; /goal clear ends it",
 			"/btw [question]   ask a side question that stays out of the conversation",
 			"@path             in a message, attaches a file; @server:uri an MCP resource",

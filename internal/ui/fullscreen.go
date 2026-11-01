@@ -47,6 +47,8 @@ type fullscreen struct {
 
 	// chromeShown: the status line last said Chrome is connected.
 	chromeShown bool
+	// chromeAsking is the site Chrome was last seen asking the user about.
+	chromeAsking string
 
 	busy       bool
 	cancel     context.CancelFunc
@@ -1632,6 +1634,8 @@ var commandList = []command{
 		subs:  []subcommand{{"on", "compact by itself, at the default size", false}, {"off", "never compact by itself", false}},
 		words: "context tokens summary size"},
 	{name: "/btw", args: "[question]", about: "ask a side question; /btw alone lists them", words: "aside question"},
+	{name: "/budget", args: "[tokens|auto]", about: "cap how long the model thinks per reply (llama-server): 16k, or auto",
+		words: "thinking reasoning tokens limit"},
 	{name: "/clear", about: "start a new conversation", words: "reset forget new"},
 	{name: "/compact", args: "[focus]", about: "summarize the conversation to free context", words: "shrink tokens summary"},
 	{name: "/effort", args: "[level]", about: "how hard the model reasons: a slider, or a level", words: "thinking reasoning"},
@@ -1704,6 +1708,13 @@ func (f *fullscreen) command(cmd string) {
 		f.help()
 	case "/effort":
 		f.effortCommand(arg)
+	case "/budget":
+		msg, ok := reasoningBudget(&f.opts, arg)
+		k := ink{}
+		if !ok {
+			k = inkYellow
+		}
+		f.say(msg, k)
 	case "/mode":
 		f.modeCommand(arg)
 	case "/model":

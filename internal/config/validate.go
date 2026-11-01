@@ -26,7 +26,7 @@ var (
 var reservedBodyKeys = map[string][]string{
 	AdapterOpenAI: {"model", "messages", "stream", "stream_options", "tools", "tool_choice",
 		"functions", "function_call", "max_tokens", "max_completion_tokens", "n", "chat_template_kwargs",
-		"reasoning_effort"},
+		"reasoning_effort", "reasoning_budget_tokens", "thinking_budget_tokens"},
 	AdapterAnthropic: {"model", "messages", "system", "stream", "tools", "tool_choice", "max_tokens",
 		"thinking", "output_config", "cache_control", "temperature", "top_p", "top_k"},
 }
@@ -35,6 +35,9 @@ var reservedBodyKeys = map[string][]string{
 var reservedBodyHints = map[string]string{
 	"chat_template_kwargs": "; use options.chat_template_kwargs",
 	"reasoning_effort":     "; use reasoning_effort",
+	// llama-server reads both names; the adapter sends both.
+	"reasoning_budget_tokens": "; use reasoning_budget_tokens",
+	"thinking_budget_tokens":  "; use reasoning_budget_tokens",
 }
 
 // ValidationError lists every problem found in a config.
@@ -258,6 +261,12 @@ func (p *Provider) validate(v *validator, name string) {
 			v.errorf(path+".options.chat_template_kwargs.reasoning_effort",
 				"conflicts with reasoning_effort, which the server applies instead; keep only one")
 		}
+	}
+	switch {
+	case p.ReasoningBudgetTokens < 0:
+		v.errorf(path+".reasoning_budget_tokens", "must not be negative")
+	case p.ReasoningBudgetTokens > 0 && p.Adapter == AdapterAnthropic:
+		v.errorf(path+".reasoning_budget_tokens", "only applies to the openai adapter; Claude's thinking follows reasoning_effort")
 	}
 }
 

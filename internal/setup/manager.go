@@ -265,6 +265,19 @@ func (m *Manager) SetAutoCompact(name string, tokens int) error {
 	})
 }
 
+// SetReasoningBudget saves the cap on the model's thinking per reply that
+// requests to a provider carry; 0 leaves it to the server.
+func (m *Manager) SetReasoningBudget(name string, tokens int) error {
+	if err := m.exists(name); err != nil {
+		return err
+	}
+	return m.change(func(cfg *config.Config) {
+		p := *cfg.Providers[name]
+		p.ReasoningBudgetTokens = tokens
+		cfg.Providers[name] = &p
+	})
+}
+
 // SetPrice saves the user's price for a model, over the built-in one.
 func (m *Manager) SetPrice(model string, p config.Price) error {
 	model = strings.ToLower(strings.TrimSpace(model))

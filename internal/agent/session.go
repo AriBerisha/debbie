@@ -37,6 +37,7 @@ type Session struct {
 	system    string
 	maxTokens int
 	effort    effort.Level
+	budget    int // tokens of reasoning per reply; 0 leaves it to the server
 	history   []provider.Message
 	mode      string
 	web       string // the web access mode (SPEC §19)
@@ -199,6 +200,22 @@ func (s *Session) SetEffort(l effort.Level) {
 	s.effort = l
 }
 
+// ReasoningBudget returns the tokens of reasoning requests allow per
+// reply; 0 leaves it to the server.
+func (s *Session) ReasoningBudget() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.budget
+}
+
+// SetReasoningBudget caps the reasoning per reply for the rest of the
+// session; 0 leaves it to the server.
+func (s *Session) SetReasoningBudget(tokens int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.budget = tokens
+}
+
 // Recorder keeps the conversation as it changes, to resume it later
 // (sessions.Recorder, SPEC §12).
 type Recorder interface {
@@ -267,7 +284,7 @@ func (s *Session) record(msgs []provider.Message, replaced bool) {
 func (s *Session) request(msgs []provider.Message) (provider.Provider, provider.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	req := provider.Request{System: s.system, Messages: msgs, MaxTokens: s.maxTokens, Effort: s.effort}
+	req := provider.Request{System: s.system, Messages: msgs, MaxTokens: s.maxTokens, Effort: s.effort, ReasoningBudget: s.budget}
 	if s.tools != nil {
 		switch s.mode {
 		case config.ApprovalPlan:

@@ -18,6 +18,7 @@ import (
 	"debbie/internal/config"
 	"debbie/internal/effort"
 	"debbie/internal/netguard"
+	"debbie/internal/prompt"
 )
 
 // maxErrorBody bounds how much of an error response is read.
@@ -80,6 +81,14 @@ type chatRequest struct {
 	Temperature        *float64                   `json:"temperature,omitempty"`
 	ReasoningEffort    string                     `json:"reasoning_effort,omitempty"`
 	ChatTemplateKwargs map[string]json.RawMessage `json:"chat_template_kwargs,omitempty"`
+	// The reasoning budget, for llama-server: the tokens the model may
+	// think per reply, after which the server ends its thinking with the
+	// message (tools/server/server-common.cpp, oaicompat_chat_params_parse).
+	// Builds before b9982 read only thinking_budget_tokens, so both carry
+	// it.
+	ReasoningBudgetTokens  int    `json:"reasoning_budget_tokens,omitempty"`
+	ThinkingBudgetTokens   int    `json:"thinking_budget_tokens,omitempty"`
+	ReasoningBudgetMessage string `json:"reasoning_budget_message,omitempty"`
 }
 
 type streamOptions struct {
@@ -298,6 +307,12 @@ func (o *OpenAI) requestBody(req Request) ([]byte, error) {
 	}
 	if o.opts.StreamUsage {
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
+	}
+	if req.ReasoningBudget > 0 {
+		body.ReasoningBudgetTokens, body.ThinkingBudgetTokens = req.ReasoningBudget, req.ReasoningBudget
+		if _, own := o.opts.ExtraBody["reasoning_budget_message"]; !own {
+			body.ReasoningBudgetMessage = prompt.ReasoningBudgetMessage
+		}
 	}
 	data, err := json.Marshal(body)
 	if err != nil || len(o.opts.ExtraBody) == 0 {

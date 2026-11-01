@@ -45,6 +45,7 @@ commands:
 | `/model` | switch the model of the current provider |
 | `/mode` | plan, default, editor, auto or yolo: how much runs without asking |
 | `/effort` | how hard the model reasons, on a slider |
+| `/budget` | cap how long the model thinks per reply, for llama-server |
 | `/autocompact` | when a long conversation is summarized to free context, on a slider |
 | `/resume` | go back to an earlier conversation in this folder (`debbie -c` resumes the latest) |
 | `/cost` | what the session cost, per model; set your own prices per million tokens |
@@ -55,9 +56,10 @@ commands:
 
 Web access is off until you turn it on. With it on, the agent can fetch pages and, through
 a companion Chrome extension, search and browse in your own Chrome: only on the sites you
-allow, in a tab of its own, never typing into password or payment fields, and asking before
-anything that buys, posts, signs in or deletes. The extension ships inside the binary, makes
-no network requests of its own and never updates itself. `debbie browser install` sets it up.
+allow (when the agent needs another, a window in Chrome asks you whether to allow it), in a
+tab of its own, never typing into password or payment fields, and asking before anything
+that buys, posts, signs in or deletes. The extension ships inside the binary, makes no
+network requests of its own and never updates itself. `debbie browser install` sets it up.
 
 ## Privacy
 

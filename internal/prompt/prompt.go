@@ -21,6 +21,12 @@ var systemText string
 //go:embed plan_mode.md
 var planModeText string
 
+// ReasoningBudgetMessage ends a model's thinking when its reasoning budget
+// (SPEC §4.3) is used up: llama-server appends it and the end-of-thinking
+// tag, so the reply follows from what was thought so far. It is the
+// sentence Qwen3's technical report inserts to stop thinking at a budget.
+const ReasoningBudgetMessage = "Considering the limited time by the user, I have to give the solution based on the thinking directly now."
+
 // Env describes the environment the agent runs in (SPEC §13).
 type Env struct {
 	Workspace string

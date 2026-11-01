@@ -46,6 +46,9 @@ type Wizard struct {
 	// URLs replace presets' URLs, by preset ID; tests point them at fakes.
 	URLs  map[string]string
 	roots *x509.CertPool // stands in for the system roots in tests
+	// budgets is set once the probe finds a server that takes a reasoning
+	// budget per request (llama-server, which answered /props).
+	budgets bool
 }
 
 // Result is a provider the wizard put together.
@@ -62,6 +65,7 @@ func (w *Wizard) Run(ctx context.Context, edit string) (*Result, error) {
 	if edit != "" {
 		old = w.Config.Providers[edit]
 	}
+	w.budgets = false
 
 	// 1. The kind of server.
 	kinds := Choice{Question: "Which model provider?"}
@@ -103,6 +107,14 @@ func (w *Wizard) Run(ctx context.Context, edit string) (*Result, error) {
 	// 6b. When the conversation is compacted by itself (SPEC §11).
 	if err := w.askAutoCompact(prov, old); err != nil {
 		return nil, err
+	}
+
+	// 6c. A cap on the model's thinking per reply, where the server takes
+	// one (SPEC §4.3).
+	if w.budgets {
+		if err := w.askReasoningBudget(prov, old); err != nil {
+			return nil, err
+		}
 	}
 
 	// 7. The name, and whether it is the default.
@@ -392,6 +404,7 @@ func (w *Wizard) probe(ctx context.Context, prov *config.Provider, key string, p
 	var levels []effort.Level
 	if preset.Props {
 		if info, err := pr.serverInfo(ctx); err == nil {
+			w.budgets = true
 			if info.ContextWindow > 0 {
 				prov.ContextWindow = info.ContextWindow
 				p.Say(fmt.Sprintf("  ✓ context: %d tokens per request (/props)", info.ContextWindow))
