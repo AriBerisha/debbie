@@ -87,7 +87,10 @@ type Call struct {
 	// change outside the workspace sets SessionFor too, to its folder.
 	Ask        string
 	SessionFor string
-	Run        func(ctx context.Context) (Result, error)
+	// OnlyLooks says a command seems to change nothing: the agent loop
+	// counts it as reading when it watches for a model that never acts.
+	OnlyLooks bool
+	Run       func(ctx context.Context) (Result, error)
 }
 
 // Result is the outcome of a call.

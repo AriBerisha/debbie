@@ -52,6 +52,9 @@ func (ReadFile) Prepare(_ context.Context, env *Env, args Args) (*Call, error) {
 		call.Outside, call.SessionKey = []string{abs}, OutsideReadKey
 	}
 	call.Run = func(context.Context) (Result, error) {
+		if res, ok, err := readImage(abs, shown); ok {
+			return res, err
+		}
 		f, data, err := readText(abs, shown)
 		if err != nil {
 			return Result{}, err

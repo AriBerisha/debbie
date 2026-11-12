@@ -81,8 +81,35 @@ func (c *chat) loadSession(path string) ([]provider.Message, error) {
 	}
 	c.opts.Session.Resume(history, tainted)
 	c.opts.Sessions.Resume(path, history, tainted)
-	c.lastUsage, c.goal = nil, nil
+	c.lastUsage, c.goal = contextEstimate(agent.EstimateTokens(history)), nil
 	return history, nil
+}
+
+// resumedTitle is the name of the conversation just resumed: the one it was
+// saved under, since after a compaction its first message is the summary.
+func (c *chat) resumedTitle(history []provider.Message) string {
+	if t := c.opts.Sessions.CurrentTitle(); t != "" {
+		return t
+	}
+	return sessions.Title(history)
+}
+
+// contextEstimate is the status line's context use before the next reply
+// says what it really is.
+func contextEstimate(tokens int) []string {
+	return []string{"ctx about " + kTokens(tokens)}
+}
+
+// resumedOn says what a resumed conversation goes on with, when that isn't
+// what it ran on: it may well be meant for the other provider.
+func (c *chat) resumedOn(path string) string {
+	info, err := sessions.Describe(path)
+	now := c.opts.Status
+	if err != nil || info.Provider == "" || info.Provider == now.Provider && info.Model == now.Model {
+		return ""
+	}
+	return fmt.Sprintf("It ran on %s (%s) and goes on with %s (%s); /provider use %s switches back.",
+		info.Provider, info.Model, now.Provider, now.Model, info.Provider)
 }
 
 // unsavedWarning says, once, that the conversation can't be saved.
@@ -134,7 +161,7 @@ func (c *chat) resume(path string) {
 		return
 	}
 	steps := agent.Replay(history)
-	c.r.println(c.st.gray(fmt.Sprintf("Resumed %q: %s. Where it left off:", sessions.Title(history), count(len(history), "message"))))
+	c.r.println(c.st.gray(fmt.Sprintf("Resumed %q: %s. Where it left off:", c.resumedTitle(history), count(len(history), "message"))))
 	var lastUser, lastText string
 	for _, s := range steps {
 		if s.User != "" {
@@ -149,6 +176,9 @@ func (c *chat) resume(path string) {
 	}
 	if lastText != "" {
 		c.r.println(lastText)
+	}
+	if on := c.resumedOn(path); on != "" {
+		c.r.println(c.st.yellow(on))
 	}
 }
 
@@ -220,7 +250,10 @@ func (f *fullscreen) resume(path string) {
 			}
 		}
 	}
-	f.say(fmt.Sprintf("Resumed %q: %s. It goes on from here.", sessions.Title(history), count(len(history), "message")), inkGray)
+	f.say(fmt.Sprintf("Resumed %q: %s. It goes on from here.", f.resumedTitle(history), count(len(history), "message")), inkGray)
+	if on := f.resumedOn(path); on != "" {
+		f.say(on, inkYellow)
+	}
 	f.refreshBanner()
 	f.scr.redraw()
 }

@@ -14,14 +14,15 @@ import (
 type Level string
 
 const (
-	Default Level = ""
-	None    Level = "none" // no reasoning at all
-	Minimal Level = "minimal"
-	Low     Level = "low"
-	Medium  Level = "medium"
-	High    Level = "high"
-	XHigh   Level = "xhigh"
-	Max     Level = "max"
+	Default       Level = ""
+	None          Level = "none" // no reasoning at all
+	Minimal       Level = "minimal"
+	Low           Level = "low"
+	Medium        Level = "medium"
+	High          Level = "high"
+	XHigh         Level = "xhigh"
+	Max           Level = "max"
+	UltraWorkflow Level = "ultraworkflow" // push the model to split work among agents; it reasons at High
 )
 
 // Ladder lists the levels at which the model reasons, weakest first.
@@ -52,16 +53,40 @@ func Parse(s string) (Level, bool) {
 		return XHigh, true
 	case "max", "maximum":
 		return Max, true
+	case "ultraworkflow":
+		return UltraWorkflow, true
 	}
 	return "", false
+}
+
+// Real is the level a model is asked to reason at: UltraWorkflow is the
+// CLI's own, a push to split work among agents, and reasons at High.
+func Real(l Level) Level {
+	if l == UltraWorkflow {
+		return High
+	}
+	return l
+}
+
+// AtMost returns l, or limit if l is stronger. Default and None stay.
+func AtMost(l, limit Level) Level {
+	if l = Real(l); rank[l] > rank[limit] {
+		return limit
+	}
+	return l
 }
 
 // Fit returns the level to send to a model whose chat template supports the
 // given levels, weakest first. A supported level is kept. Otherwise the next
 // stronger supported level is used, and a request above the strongest gets
 // the strongest. Default and None pass through unchanged, and so does every
-// level when nothing is known about the model.
+// level when nothing is known about the model. UltraWorkflow counts as the
+// level it reasons at (see Real), except that when nothing is known it leaves
+// the choice to the server: the user chose no level, and a chat template may
+// refuse one it doesn't have.
 func Fit(l Level, supported []Level) Level {
+	push := l == UltraWorkflow
+	l = Real(l)
 	if l == Default || l == None || slices.Contains(supported, l) {
 		return l
 	}
@@ -84,6 +109,8 @@ func Fit(l Level, supported []Level) Level {
 		return next
 	case strongest != "":
 		return strongest
+	case push:
+		return Default
 	}
 	return l
 }

@@ -44,13 +44,39 @@ commands:
 | `/provider` | switch between your providers, or add one |
 | `/model` | switch the model of the current provider |
 | `/mode` | plan, default, editor, auto or yolo: how much runs without asking |
-| `/effort` | how hard the model reasons, on a slider |
-| `/budget` | cap how long the model thinks per reply, for llama-server |
-| `/autocompact` | when a long conversation is summarized to free context, on a slider |
-| `/resume` | go back to an earlier conversation in this folder (`debbie -c` resumes the latest) |
+| `/effort` | how hard the model reasons; `/effort budget` caps its thinking per reply, for llama-server |
+| `/compact` | summarize the conversation to free context; `/compact auto` sets when it happens by itself |
+| `/resume` | go back to an earlier conversation in this folder (`debbie -c` resumes the latest); `/resume rename` names this one |
 | `/cost` | what the session cost, per model; set your own prices per million tokens |
-| `/web` | web access for the agent: off (the default), safe or yolo |
-| `/help` | the rest |
+| `/web` | web access for the agent: off (the default), safe or yolo; `/web browser` for Chrome's connection |
+| `/help` | the rest; `/help tools` lists the tools |
+
+## Agents
+
+On any provider, the model can start agents when a job splits into independent parts: several
+side by side, or in the background while it keeps working, in which case the agent's report
+reaches it by itself. In the fullscreen UI, ↓ from an empty input box shows them: Enter opens
+one, Delete or Ctrl+C in its view stops it. `/effort ultraworkflow` pushes the model to split
+substantial work; it reasons at high effort then.
+
+Agents can run on something cheaper than the conversation. `/provider workers` says what they
+run on, and changes it:
+
+```text
+/provider workers home                     a Claude lead with workers on your local server
+/provider workers claude claude-haiku-5-5  the same provider, another model
+/provider workers home qwen3.8-flash low   with a model and an effort of their own
+/provider workers off                      back to the conversation's
+```
+
+Unless you set an effort for them, agents reason at the conversation's, at most medium. Up to
+four run at once on a cloud provider; on a server of your own, `subagents.max_parallel` decides
+(1 by default, since each llama-server slot gets its share of the context). What they spend
+shows in `/cost`, per model.
+
+The model knows what its agents run on, how many run at a time, and whether they see images, so
+it can keep work that takes looking at a picture for itself. `read_file` shows a model PNG, JPEG,
+GIF and WebP images if its provider has `vision` on, as Claude does; `@shot.png` asks it to.
 
 ## Web access and the Chrome extension
 

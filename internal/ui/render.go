@@ -71,6 +71,15 @@ func (r *renderer) event(ev provider.Event) {
 		text = e.Text
 	case provider.ReasoningDelta:
 		text, reasoning = e.Text, true
+	case provider.Note:
+		r.stopSpinner()
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.newline()
+		r.buf.WriteString(r.st.gray("· ") + e.Text + "\n")
+		r.col0 = true
+		r.flush()
+		return
 	default:
 		return
 	}

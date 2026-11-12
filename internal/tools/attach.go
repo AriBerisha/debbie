@@ -141,6 +141,9 @@ func (w *Workspace) Attach(p string) (Attachment, error) {
 		return Attachment{}, fmt.Errorf("%s is outside the workspace", p)
 	}
 	shown := w.Rel(abs)
+	if fileImageType(abs) != "" {
+		return Attachment{Path: shown, Text: "[This is an image, so its content isn't here. Call read_file on it to see it, if you can see images.]"}, nil
+	}
 	f, _, err := readText(abs, shown)
 	if err != nil {
 		return Attachment{}, err

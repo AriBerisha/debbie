@@ -47,6 +47,9 @@ type Part struct {
 	// Opaque holds provider data that must be sent back verbatim, such as an
 	// Anthropic thinking signature.
 	Opaque json.RawMessage
+	// Hidden marks text the model gets but the user didn't write, such as
+	// a note that a mode changed: the conversation doesn't show it.
+	Hidden bool
 }
 
 // ToolCall is a request from the model to run a tool.
@@ -64,7 +67,7 @@ type ToolResult struct {
 
 // Image is a picture for a model that sees images.
 type Image struct {
-	MediaType string // "image/jpeg" or "image/png"
+	MediaType string // "image/jpeg", "image/png", "image/gif" or "image/webp"
 	Data      []byte
 }
 
@@ -123,6 +126,17 @@ func (m Message) Text() string {
 	return b.String()
 }
 
+// Shown returns the text parts as the user sees them: without hidden ones.
+func (m Message) Shown() string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if p.Kind == PartText && !p.Hidden {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
 func (m Message) hasToolResults() bool {
 	for _, p := range m.Parts {
 		if p.Kind == PartToolResult {
@@ -133,7 +147,7 @@ func (m Message) hasToolResults() bool {
 }
 
 // Event is one item of a streamed response: TextDelta, TextEnd,
-// ReasoningDelta, ReasoningEnd, ToolCallStart, ToolCallArgsDelta,
+// ReasoningDelta, ReasoningEnd, Note, ToolCallStart, ToolCallArgsDelta,
 // ToolCallEnd, Usage or Done; and Retrying, from StreamRetry.
 type Event interface{ isEvent() }
 
@@ -151,6 +165,11 @@ type ReasoningDelta struct{ Text string }
 // as the provider sent it, which goes back to it unchanged in later
 // requests: an Anthropic thinking block with its signature (SPEC §4.4).
 type ReasoningEnd struct{ Opaque json.RawMessage }
+
+// Note is a short progress note the model wrote between tool calls: what it
+// found, or what it does next. The newest Claude models return these as
+// thinking blocks, so a ReasoningEnd with the block follows it.
+type Note struct{ Text string }
 
 // Retrying says a request failed in a way worth another try, which comes
 // after Wait (SPEC §4.5).
@@ -177,6 +196,13 @@ type Usage struct {
 	CacheRead, CacheWrite int
 }
 
+// PrefixCacher is a provider whose prompt cache covers a request as long as
+// the system prompt, the tools and the earlier messages stay the same, so a
+// side request, such as compaction, should repeat them.
+type PrefixCacher interface {
+	CachesPrefix() bool
+}
+
 // Modeler is a provider that says which model it asks for; both adapters
 // do, and the session prices requests by it.
 type Modeler interface {
@@ -195,6 +221,7 @@ func (TextDelta) isEvent()         {}
 func (TextEnd) isEvent()           {}
 func (ReasoningDelta) isEvent()    {}
 func (ReasoningEnd) isEvent()      {}
+func (Note) isEvent()              {}
 func (Retrying) isEvent()          {}
 func (ToolCallStart) isEvent()     {}
 func (ToolCallArgsDelta) isEvent() {}

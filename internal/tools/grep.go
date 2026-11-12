@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -57,11 +58,11 @@ func (Grep) Prepare(ctx context.Context, env *Env, args Args) (*Call, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !inside {
-		return nil, fmt.Errorf("%s is outside the workspace; searches stay inside it", abs)
-	}
 	shown := env.Workspace.Rel(abs)
 	call := &Call{Kind: Read, Summary: fmt.Sprintf("grep %q in %s", args.String("pattern"), shown)}
+	if !inside {
+		call.Outside, call.SessionKey = []string{abs}, OutsideReadKey
+	}
 	call.Run = func(ctx context.Context) (Result, error) {
 		fold := env.Workspace.fold
 		selected := func(rel string) bool {
@@ -112,9 +113,12 @@ func (Grep) Prepare(ctx context.Context, env *Env, args Args) (*Call, error) {
 		case !fi.IsDir():
 			err = search(abs, shown)
 		default:
-			err = env.Workspace.walker().walk(ctx, abs, func(fileAbs, rel string, d fs.DirEntry) error {
+			err = searchWalker(env, abs, inside).walk(ctx, abs, func(fileAbs, rel string, d fs.DirEntry) error {
 				if d.IsDir() || !selected(rel) {
 					return nil
+				}
+				if !inside {
+					return search(fileAbs, filepath.ToSlash(fileAbs)) // a path read_file takes
 				}
 				return search(fileAbs, rel)
 			})

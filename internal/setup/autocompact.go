@@ -12,7 +12,7 @@ import (
 // askAutoCompact asks at what context size a conversation with the
 // provider is summarized to make room (SPEC §11), once the model's
 // context window is known: the usual size, shares of the window, never,
-// or a number typed in. /autocompact changes it later.
+// or a number typed in. /compact auto changes it later.
 func (w *Wizard) askAutoCompact(prov *config.Provider, old *config.Provider) error {
 	window := prov.ContextWindow
 	type choice struct {

@@ -10,7 +10,7 @@ import (
 )
 
 // /cost says what the session spent, by model, and sets a model's prices;
-// /rename names the conversation. Both UIs share the answers below.
+// /resume rename names the conversation. Both UIs share the answers below.
 
 // costPart is the session's cost for the status line, once it is above
 // zero; a "+" after it means a model in use has no price, so the amount
@@ -132,7 +132,7 @@ func (c *chat) priceLine(model string) string {
 	return model + ": " + cost.Describe(p) + " (built in, as " + key + ")."
 }
 
-// renameReport answers /rename: with a title it names the conversation,
+// renameReport answers /resume rename: with a title it names the conversation,
 // alone it says what it is called.
 func (c *chat) renameReport(arg string) (string, bool) {
 	if c.opts.Sessions == nil {
@@ -140,9 +140,9 @@ func (c *chat) renameReport(arg string) (string, bool) {
 	}
 	if strings.TrimSpace(arg) == "" {
 		if t := c.opts.Sessions.CurrentTitle(); t != "" {
-			return fmt.Sprintf("This conversation is called %q; /rename <name> changes it.", t), false
+			return fmt.Sprintf("This conversation is called %q; /resume rename <name> changes it.", t), false
 		}
-		return "This conversation has no name yet: it takes its first message's, or /rename <name> gives it one.", false
+		return "This conversation has no name yet: it takes its first message's, or /resume rename <name> gives it one.", false
 	}
 	if err := c.opts.Sessions.Rename(arg); err != nil {
 		return "Can't name it: " + err.Error(), true

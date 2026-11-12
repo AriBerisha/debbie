@@ -210,7 +210,7 @@ func (t ShellTool) Params() []Param {
 		{Name: "timeout_seconds", Type: "integer", Aliases: []string{"timeout"},
 			Description: fmt.Sprintf("How long it may run, at most %d seconds; %d when omitted.", int(MaxShellTimeout/time.Second), int(t.Shell.Timeout/time.Second))},
 		{Name: "directory", Type: "string", Aliases: []string{"cwd", "workdir", "dir_path"},
-			Description: "A directory inside the workspace to run in; the workspace root when omitted."},
+			Description: "The directory to run in; the workspace root when omitted."},
 	}
 }
 
@@ -220,13 +220,14 @@ func (t ShellTool) Prepare(_ context.Context, env *Env, args Args) (*Call, error
 		return nil, errors.New("the command is empty")
 	}
 	dir, shownDir := env.Workspace.Root(), ""
+	var outside []string
 	if d := args.String("directory"); d != "" && d != "." {
 		abs, inside, err := env.Workspace.Resolve(d)
 		if err != nil {
 			return nil, err
 		}
 		if !inside {
-			return nil, fmt.Errorf("%s is outside the workspace; commands run inside it", abs)
+			outside = []string{abs}
 		}
 		if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
 			return nil, fmt.Errorf("%s is not a directory", env.Workspace.Rel(abs))
@@ -252,7 +253,7 @@ func (t ShellTool) Prepare(_ context.Context, env *Env, args Args) (*Call, error
 		summary += " (in " + shownDir + ")"
 		preview += "\n(in " + shownDir + ")"
 	}
-	call := &Call{Kind: Execute, Summary: summary, Preview: preview, SessionKey: "shell:" + shownDir + "\x00" + command}
+	call := &Call{Kind: Execute, Summary: summary, Preview: preview, SessionKey: "shell:" + shownDir + "\x00" + command, OnlyLooks: commandOnlyLooks(command), Outside: outside}
 	call.Run = func(ctx context.Context) (Result, error) {
 		res, err := t.Shell.Run(ctx, command, dir, timeout)
 		if err != nil && ctx.Err() == nil {
@@ -285,6 +286,29 @@ func (t ShellTool) Prepare(_ context.Context, env *Env, args Args) (*Call, error
 		}, nil
 	}
 	return call, nil
+}
+
+// commandActs finds what makes a command more than a look around: programs
+// that change files or state, and those that build, test or run something.
+// The list needn't be complete: a command it misses only counts as reading,
+// and the model gets told to act or report.
+var commandActs = regexp.MustCompile(`(?i)(^|[\s;&|(])(` +
+	`git(\s+-C\s+\S+)?\s+(commit|merge|rebase|cherry-pick|apply|am|push|pull|fetch|checkout|switch|reset|restore|stash|add|rm|mv|clean|tag|revert|worktree\s+(add|remove|prune))` +
+	`|rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|tee|patch|truncate|sed\s+-i|del|erase|rd|ren|move|copy|xcopy|robocopy|md` +
+	`|set-content|add-content|out-file|new-item|remove-item|move-item|copy-item|rename-item|clear-content|set-location\s+-|start-process|stop-process|invoke-webrequest` +
+	`|go\s+(build|test|run|generate|install|get|mod)|cargo|make|cmake|msbuild|dotnet|ninja|gradle|mvn|npm|npx|pnpm|yarn|node|bun|deno|python\d?|py|pip\d?|pytest|ruby|php|java|javac|gcc|g\+\+|clang|tsc|docker|kubectl|terraform|curl|wget` +
+	`)(\s|$|[;&|)])`)
+
+// commandRedirects finds output written to a file; what goes nowhere, and a
+// stream joining another, are removed first.
+var (
+	commandNoFile    = regexp.MustCompile(`(?i)(\d?>&\d|\d?>+\s*(/dev/null|\$null|nul)\b|[-=]>)`)
+	commandRedirects = regexp.MustCompile(`>`)
+)
+
+// commandOnlyLooks reports whether a command seems to change nothing.
+func commandOnlyLooks(command string) bool {
+	return !commandActs.MatchString(command) && !commandRedirects.MatchString(commandNoFile.ReplaceAllString(command, ""))
 }
 
 // oneLine shortens text to its first line and at most n characters.

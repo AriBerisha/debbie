@@ -3,7 +3,6 @@ package ui
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"debbie/internal/tools"
 )
@@ -82,10 +81,8 @@ func (f *fullscreen) suggestions() (list []suggestion, start int) {
 }
 
 // commandSuggestions completes a command being typed: the commands it
-// starts; after a command's name, or with it typed in full, its
-// subcommands; and the commands and subcommands whose description
-// mentions a word that starts with what was typed, so /chrome finds
-// /browser install. ok is false past the subcommand.
+// starts; and after a command's name, or with it typed in full, its
+// subcommands. ok is false when nothing fits past the name.
 func (f *fullscreen) commandSuggestions(typed string) (list []suggestion, ok bool) {
 	seen := map[string]bool{}
 	add := func(s suggestion) {
@@ -99,7 +96,7 @@ func (f *fullscreen) commandSuggestions(typed string) (list []suggestion, ok boo
 		// Past the command's name, only its subcommands; anything else,
 		// such as an @ mention, completes as in a message.
 		c := findCommand(name)
-		if c == nil || strings.Contains(rest, " ") {
+		if c == nil {
 			return nil, false
 		}
 		for _, s := range c.subs {
@@ -119,20 +116,6 @@ func (f *fullscreen) commandSuggestions(typed string) (list []suggestion, ok boo
 			add(subSuggestion(c, s))
 		}
 	}
-	if q := strings.ToLower(typed[1:]); len(q) >= 2 {
-		for i := range commandList {
-			c := &commandList[i]
-			found := mentions(c.about+" "+c.words, q)
-			if found {
-				add(suggestion{text: c.name, label: c.name, about: c.about, args: c.args != ""})
-			}
-			for _, s := range c.subs {
-				if found || strings.HasPrefix(s.name, q) || mentions(s.about, q) {
-					add(subSuggestion(c, s))
-				}
-			}
-		}
-	}
 	return list, true
 }
 
@@ -148,16 +131,6 @@ func findCommand(name string) *command {
 func subSuggestion(c *command, s subcommand) suggestion {
 	text := c.name + " " + s.name
 	return suggestion{text: text, label: text, about: s.about, args: s.args}
-}
-
-// mentions reports whether text has a word that starts with q.
-func mentions(text, q string) bool {
-	for _, w := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
-		if strings.HasPrefix(w, q) {
-			return true
-		}
-	}
-	return false
 }
 
 // suggestCache keeps the last path completion, so the workspace is walked
@@ -308,7 +281,11 @@ func expandMentions(text string, attach func(string) (tools.Attachment, error),
 			continue
 		}
 		blocks = append(blocks, fmt.Sprintf("<attached_file path=%q lines=\"%d\">\n%s\n</attached_file>", a.Path, a.Lines, a.Text))
-		notes = append(notes, attached{text: fmt.Sprintf("attached %s · %d line%s", a.Path, a.Lines, pluralS(a.Lines)), ok: true})
+		size := fmt.Sprintf("%d line%s", a.Lines, pluralS(a.Lines))
+		if a.Lines == 0 && strings.HasPrefix(a.Text, "[") {
+			size = "an image"
+		}
+		notes = append(notes, attached{text: "attached " + a.Path + " · " + size, ok: true})
 	}
 	if len(blocks) == 0 {
 		return text, notes

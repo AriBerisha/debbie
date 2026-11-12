@@ -16,7 +16,7 @@ var budgetSizes = []int{4000, 8000, 16000, 32000}
 // reply (SPEC §4.3), for a server that takes a reasoning budget per
 // request, where thinking otherwise runs as long as the model likes: no
 // cap, a few sizes under half the context window, or a number typed in.
-// /budget changes it later.
+// /effort budget changes it later.
 func (w *Wizard) askReasoningBudget(prov *config.Provider, old *config.Provider) error {
 	window := prov.ContextWindow
 	def := 0

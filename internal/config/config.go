@@ -19,11 +19,18 @@ import (
 // CurrentVersion is the schema version this build reads and writes.
 const CurrentVersion = 1
 
-// Adapters.
+// Adapters: OpenAI's Chat Completions API, which the self-hosted servers
+// and most cloud services speak; OpenAI's own Responses API (SPEC §4.6);
+// and Anthropic's Messages API.
 const (
-	AdapterOpenAI    = "openai"
-	AdapterAnthropic = "anthropic"
+	AdapterOpenAI          = "openai"
+	AdapterOpenAIResponses = "openai-responses"
+	AdapterAnthropic       = "anthropic"
 )
+
+// presetOpenAI is the wizard's preset for OpenAI's own service
+// (internal/setup), whose adapter changed (applyDefaults).
+const presetOpenAI = "openai"
 
 // Approval modes (SPEC §9).
 const (
@@ -170,7 +177,14 @@ type ProviderOptions struct {
 
 // Subagents configures the task tool (SPEC §10).
 type Subagents struct {
-	Provider    string `json:"provider"`
+	// Provider names the provider agents run on, such as a local server
+	// under a Claude lead; empty uses the conversation's.
+	Provider string `json:"provider"`
+	// Model names the model they ask for on it; empty uses its own.
+	Model string `json:"model,omitempty"`
+	// Effort is how hard they reason; empty is the conversation's, at most
+	// medium, since they do bounded work.
+	Effort      string `json:"effort,omitempty"`
 	MaxParallel int    `json:"max_parallel"`
 	MaxTurns    int    `json:"max_turns"`
 }
@@ -218,6 +232,12 @@ func (c *Config) applyDefaults() {
 		}
 		if p.StreamIdleSeconds == 0 {
 			p.StreamIdleSeconds = DefaultStreamIdleSeconds
+		}
+		// Until 2026-11-07 the wizard set OpenAI's own service up with
+		// the Chat Completions adapter, which its newest models refuse
+		// with tools; they take the Responses API (SPEC §4.6).
+		if p.Preset == presetOpenAI && p.Adapter == AdapterOpenAI {
+			p.Adapter = AdapterOpenAIResponses
 		}
 	}
 	if c.ApprovalMode == "" {

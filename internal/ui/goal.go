@@ -33,6 +33,24 @@ type goal struct {
 // goal: the model is talking, not working.
 const goalStallTurns = 3
 
+// goalMaxTurns is how many checked turns pause a goal, so one set and left
+// alone can't spend without end.
+const goalMaxTurns = 25
+
+// goalHold says why the goal must pause after a checked turn, "" when it
+// may go on.
+func goalHold(g *goal, v agent.GoalVerdict) string {
+	switch {
+	case v.Verdict == agent.GoalUnclear:
+		return "The goal check gave no verdict, so the goal is paused. Send a message to continue, or /goal clear."
+	case g.quiet >= goalStallTurns:
+		return fmt.Sprintf("No tool calls in the last %d turns; the goal is paused. Send a message to continue, or /goal clear.", goalStallTurns)
+	case g.checks >= goalMaxTurns:
+		return fmt.Sprintf("The goal has run for %d turns and is paused. Send a message to continue, or /goal clear.", g.checks)
+	}
+	return ""
+}
+
 // goalOff are the words that clear a goal.
 var goalOff = map[string]bool{"clear": true, "stop": true, "off": true, "reset": true, "none": true, "cancel": true}
 
@@ -111,10 +129,15 @@ func (f *fullscreen) goalCommand(arg string) {
 
 // goalStep runs after a turn and any compaction: it checks the goal, or
 // pauses it after an interruption or error, then sends what comes next.
-func (f *fullscreen) goalStep(turnErr error) {
+func (f *fullscreen) goalStep(turnErr error, stopped string) {
 	g := f.goal
 	switch {
 	case g == nil || g.paused:
+		f.sendQueued()
+		return
+	case stopped != "": // the agent loop ended the turn: the user decides
+		g.paused = true
+		f.say("Goal paused; send a message to continue, or /goal clear.", inkYellow)
 		f.sendQueued()
 		return
 	case errors.Is(turnErr, context.Canceled):
@@ -179,12 +202,14 @@ func (f *fullscreen) goalChecked(g *goal, v agent.GoalVerdict, err error) {
 		return
 	}
 	f.tr.add(&goalBlock{event: goalNotYet, text: v.Reason})
+	hold := goalHold(g, v)
 	switch {
 	case len(f.queue) > 0:
 		f.sendQueued() // the user's message first; the check comes after it
-	case g.quiet >= goalStallTurns:
+	case hold != "":
 		g.paused = true
-		f.say(fmt.Sprintf("No tool calls in the last %d turns; the goal is paused. Send a message to continue, or /goal clear.", goalStallTurns), inkYellow)
+		f.say(hold, inkYellow)
+		f.sendQueued()
 	default:
 		f.sendAs("", prompt.GoalContinue(g.condition, v.Reason))
 	}
@@ -241,6 +266,10 @@ func (c *chat) runGoal(text string) (quit bool) {
 			g.paused = true
 			c.r.println(c.st.yellow("Goal paused after the error; send a message to continue, or /goal clear."))
 			return false
+		case c.turnStopped != "": // the agent loop ended the turn: the user decides
+			g.paused = true
+			c.r.println(c.st.yellow("Goal paused; send a message to continue, or /goal clear."))
+			return false
 		}
 		if c.turnTools == 0 {
 			g.quiet++
@@ -273,9 +302,9 @@ func (c *chat) runGoal(text string) (quit bool) {
 			return false
 		}
 		c.r.println(c.st.gray(mark + "Not met yet · " + v.Reason))
-		if g.quiet >= goalStallTurns {
+		if hold := goalHold(g, v); hold != "" {
 			g.paused = true
-			c.r.println(c.st.yellow(fmt.Sprintf("No tool calls in the last %d turns; the goal is paused. Send a message to continue, or /goal clear.", goalStallTurns)))
+			c.r.println(c.st.yellow(hold))
 			return false
 		}
 		text = prompt.GoalContinue(g.condition, v.Reason)

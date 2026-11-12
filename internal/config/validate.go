@@ -27,6 +27,8 @@ var reservedBodyKeys = map[string][]string{
 	AdapterOpenAI: {"model", "messages", "stream", "stream_options", "tools", "tool_choice",
 		"functions", "function_call", "max_tokens", "max_completion_tokens", "n", "chat_template_kwargs",
 		"reasoning_effort", "reasoning_budget_tokens", "thinking_budget_tokens"},
+	AdapterOpenAIResponses: {"model", "input", "instructions", "stream", "tools", "tool_choice",
+		"max_output_tokens", "reasoning", "store", "include", "previous_response_id", "conversation"},
 	AdapterAnthropic: {"model", "messages", "system", "stream", "tools", "tool_choice", "max_tokens",
 		"thinking", "output_config", "cache_control", "temperature", "top_p", "top_k"},
 }
@@ -35,6 +37,7 @@ var reservedBodyKeys = map[string][]string{
 var reservedBodyHints = map[string]string{
 	"chat_template_kwargs": "; use options.chat_template_kwargs",
 	"reasoning_effort":     "; use reasoning_effort",
+	"reasoning":            "; use reasoning_effort",
 	// llama-server reads both names; the adapter sends both.
 	"reasoning_budget_tokens": "; use reasoning_budget_tokens",
 	"thinking_budget_tokens":  "; use reasoning_budget_tokens",
@@ -131,6 +134,9 @@ func (c *Config) validate(v *validator) {
 			v.errorf("subagents.provider", "there is no provider named %q", c.Subagents.Provider)
 		}
 	}
+	if _, ok := effort.Parse(c.Subagents.Effort); !ok || c.Subagents.Effort == string(effort.UltraWorkflow) {
+		v.errorf("subagents.effort", "unknown level %q (use none, minimal, low, medium, high, xhigh or max)", c.Subagents.Effort)
+	}
 	if c.Subagents.MaxParallel < 1 {
 		v.errorf("subagents.max_parallel", "must be at least 1")
 	}
@@ -191,11 +197,11 @@ func (c *Config) validate(v *validator) {
 func (p *Provider) validate(v *validator, name string) {
 	path := "providers." + name
 	switch p.Adapter {
-	case AdapterOpenAI, AdapterAnthropic:
+	case AdapterOpenAI, AdapterOpenAIResponses, AdapterAnthropic:
 	case "":
-		v.errorf(path+".adapter", "missing (use openai or anthropic)")
+		v.errorf(path+".adapter", "missing (use openai, openai-responses or anthropic)")
 	default:
-		v.errorf(path+".adapter", "unknown adapter %q (use openai or anthropic)", p.Adapter)
+		v.errorf(path+".adapter", "unknown adapter %q (use openai, openai-responses or anthropic)", p.Adapter)
 	}
 
 	u, err := checkBaseURL(p.BaseURL)
@@ -244,7 +250,7 @@ func (p *Provider) validate(v *validator, name string) {
 		v.errorf(path+".stream_idle_seconds", "must not be negative")
 	}
 
-	if len(p.Options.ChatTemplateKwargs) > 0 && p.Adapter == AdapterAnthropic {
+	if len(p.Options.ChatTemplateKwargs) > 0 && p.Adapter != AdapterOpenAI {
 		v.errorf(path+".options.chat_template_kwargs", "only applies to the openai adapter")
 	}
 	for _, key := range sortedKeys(p.Options.ExtraBody) {
@@ -255,7 +261,7 @@ func (p *Provider) validate(v *validator, name string) {
 
 	if p.ReasoningEffort != "" {
 		if _, ok := effort.Parse(p.ReasoningEffort); !ok {
-			v.errorf(path+".reasoning_effort", "unknown level %q (use none, minimal, low, medium, high, xhigh or max)", p.ReasoningEffort)
+			v.errorf(path+".reasoning_effort", "unknown level %q (use none, minimal, low, medium, high, xhigh, max or ultraworkflow)", p.ReasoningEffort)
 		}
 		if _, set := p.Options.ChatTemplateKwargs["reasoning_effort"]; set {
 			v.errorf(path+".options.chat_template_kwargs.reasoning_effort",
@@ -267,6 +273,8 @@ func (p *Provider) validate(v *validator, name string) {
 		v.errorf(path+".reasoning_budget_tokens", "must not be negative")
 	case p.ReasoningBudgetTokens > 0 && p.Adapter == AdapterAnthropic:
 		v.errorf(path+".reasoning_budget_tokens", "only applies to the openai adapter; Claude's thinking follows reasoning_effort")
+	case p.ReasoningBudgetTokens > 0 && p.Adapter == AdapterOpenAIResponses:
+		v.errorf(path+".reasoning_budget_tokens", "only applies to the openai adapter; OpenAI's reasoning follows reasoning_effort")
 	}
 }
 

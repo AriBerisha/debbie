@@ -38,7 +38,9 @@ var Presets = []Preset{
 		KeyEnv: "OPENAI_COMPATIBLE_API_KEY", ToolFix: "check that the server supports the tools parameter of /chat/completions"},
 	{ID: "claude", Name: "Claude (Anthropic)", About: "Anthropic's models, with an API key", Adapter: config.AdapterAnthropic, URL: "https://api.anthropic.com",
 		KeyEnv: "ANTHROPIC_API_KEY", Cloud: true, KeysURL: claudeKeysURL, KeyPrefix: "sk-ant-"},
-	{ID: "openai", Name: "OpenAI", About: "OpenAI's models, with an API key", Adapter: config.AdapterOpenAI, URL: "https://api.openai.com/v1",
+	// OpenAI's own API is spoken to as the Responses API (SPEC §4.6): its
+	// newest models take function tools with reasoning only there.
+	{ID: "openai", Name: "OpenAI", About: "OpenAI's models, with an API key", Adapter: config.AdapterOpenAIResponses, URL: "https://api.openai.com/v1",
 		KeyEnv: "OPENAI_API_KEY", Cloud: true, KeysURL: "https://platform.openai.com/api-keys", KeyPrefix: "sk-"},
 	{ID: "gemini", Name: "Gemini", About: "Google's models, with an API key", Adapter: config.AdapterOpenAI, URL: "https://generativelanguage.googleapis.com/v1beta/openai",
 		KeyEnv: "GEMINI_API_KEY", Cloud: true, KeysURL: "https://aistudio.google.com/apikey", KeyPrefix: "AIza"},

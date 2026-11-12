@@ -7,13 +7,13 @@ import (
 	"debbie/internal/setup"
 )
 
-// /budget: a cap on how long the model thinks per reply, for llama-server
+// /effort budget: a cap on how long the model thinks per reply, for llama-server
 // (SPEC §4.3).
 
-// budgetUsage says what /budget takes.
+// budgetUsage says what /effort budget takes.
 const budgetUsage = "Give a number of tokens such as 8k or 16000, or auto for no cap."
 
-// reasoningBudget runs /budget for either UI: with no argument it says
+// reasoningBudget runs /effort budget for either UI: with no argument it says
 // whether the model's thinking per reply is capped; with a number of
 // tokens (16000 or 16k) or auto, it changes that for the session and
 // saves it for the provider. It returns what to tell the user, and false

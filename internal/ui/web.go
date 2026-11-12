@@ -24,7 +24,7 @@ func webCommand(opts *ChatOptions, arg string) (msg string, ok, yolo bool) {
 	}
 	switch arg = strings.ToLower(arg); arg {
 	case "":
-		return "Web access: " + w.Mode() + " (" + webModes[w.Mode()] + "). /web off, /web safe or /web yolo switches; /browser shows Chrome's connection.", true, false
+		return "Web access: " + w.Mode() + " (" + webModes[w.Mode()] + "). /web off, /web safe or /web yolo switches; /web browser shows Chrome's connection.", true, false
 	case config.WebOff, config.WebSafe:
 		return setWeb(opts, arg)
 	case config.WebYolo:
@@ -41,7 +41,7 @@ func setWeb(opts *ChatOptions, mode string) (msg string, ok, yolo bool) {
 		return msg + " " + note + ".", false, false
 	}
 	if mode != config.WebOff {
-		msg += " /browser shows whether Chrome is connected; /browser install sets it up."
+		msg += " /web browser shows whether Chrome is connected; /web browser install sets it up."
 	}
 	return msg, true, false
 }
@@ -49,7 +49,7 @@ func setWeb(opts *ChatOptions, mode string) (msg string, ok, yolo bool) {
 // webYoloWarning is what the user confirms before web yolo.
 const webYoloWarning = "Web yolo opens pages on the extension's sites without asking you. Tokens in an address still ask."
 
-// browserCommand runs /browser: how web access and Chrome's connection
+// browserCommand runs /web browser: how web access and Chrome's connection
 // stand.
 func browserCommand(opts *ChatOptions) []string {
 	if opts.Web == nil {

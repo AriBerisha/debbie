@@ -57,7 +57,7 @@ func replaceNote(former string) string {
 const profileNote = "It works in your Chrome profile, signed in as you: on the sites it allows, the agent reads and clicks " +
 	"as you would, and anything that would buy, subscribe, post or sign in asks you first."
 
-// browserPanel walks the user through /browser install one step at a
+// browserPanel walks the user through /web browser install one step at a
 // time: what the install did, then the steps in Chrome with the one at
 // hand highlighted and what it pastes on the clipboard, and whether
 // Chrome connected.
@@ -74,7 +74,7 @@ type browserPanel struct {
 	sel       int
 }
 
-// browserInstall runs /browser install in the fullscreen UI.
+// browserInstall runs /web browser install in the fullscreen UI.
 func (f *fullscreen) browserInstall() {
 	w := f.opts.Web
 	if w == nil {
@@ -368,7 +368,7 @@ func (f *fullscreen) watchChrome() {
 	f.chromeShown = now
 }
 
-// browserInstall runs /browser install in line mode: the install, then the
+// browserInstall runs /web browser install in line mode: the install, then the
 // steps in Chrome, then a wait for the connection that Ctrl+C ends.
 func (c *chat) browserInstall() {
 	w := c.opts.Web
@@ -419,7 +419,7 @@ func (c *chat) browserInstall() {
 		}
 		select {
 		case <-ctx.Done():
-			c.r.println("Stopped waiting. /browser shows whether Chrome connected.")
+			c.r.println("Stopped waiting. /web browser shows whether Chrome connected.")
 			return
 		case <-time.After(250 * time.Millisecond):
 		}

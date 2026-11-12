@@ -322,33 +322,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// The task tool's subagents (SPEC §10) use subagents.provider when the
-	// config names one, connected at the first task call, else the
-	// session's provider.
-	var subagentProvider func() (provider.Provider, int, error)
-	if name := cfg.Subagents.Provider; name != "" {
-		var once sync.Once
-		var sub *setup.Conn
-		var subErr error
-		subagentProvider = func() (provider.Provider, int, error) {
-			once.Do(func() {
-				p := cfg.Providers[name]
-				if p == nil {
-					subErr = fmt.Errorf("subagents.provider names %q, which isn't a configured provider", name)
-					return
-				}
-				if sub, subErr = setup.Connect(context.Background(), name, *p, os.Getenv); subErr == nil {
-					redactor.Add(sub.APIKey)
-				}
-			})
-			if subErr != nil {
-				return nil, 0, subErr
-			}
-			return sub.Adapter, sub.Provider.MaxOutputTokens, nil
-		}
-	}
+	// The task tool's agents (SPEC §10) run on what the config's subagents
+	// section says at the moment: a provider and model of their own,
+	// connected at the first task call that needs them, or the session's.
+	workers := setup.NewWorkers(cfg, os.Getenv, redactor.Add, func() *setup.Conn { return active })
 	registry.Add(agent.NewTaskTool(session, func(full bool) string { return prompt.Subagent(env, full) },
-		subagentProvider, cfg.Subagents.MaxParallel, cfg.Subagents.MaxTurns))
+		workers.Current, cfg.Subagents.MaxTurns))
+	session.SetAgentNote(workers.Note)
+	session.SetVision(func() bool { return active.Provider.Vision })
 	if term.Interactive {
 		// The model's questions need someone at the keyboard: piped input
 		// can't pick an answer.
@@ -475,6 +456,9 @@ func chooseProvider(cfg *config.Config, rawURL, model, keyEnv string) (string, *
 			Adapter: config.AdapterOpenAI,
 			BaseURL: rawURL,
 			Options: config.ProviderOptions{StreamUsage: true},
+		}
+		if strings.EqualFold(u.Hostname(), "api.openai.com") {
+			p.Adapter = config.AdapterOpenAIResponses // OpenAI's own API (SPEC §4.6)
 		}
 	} else {
 		n, active, ok := cfg.ActiveProvider()

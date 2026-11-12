@@ -20,7 +20,16 @@ const (
 	GoalMet        = "met"
 	GoalNotMet     = "not_met"
 	GoalImpossible = "impossible"
+	// GoalUnclear is a check without an answer that can be read: the model
+	// thought until the limit, or called a tool instead. It says nothing
+	// about the goal, so the goal pauses rather than keep the model working.
+	GoalUnclear = "unclear"
 )
+
+// goalCheckTokens limits the check's reply. On a model that thinks, thinking
+// counts toward it, and the check has the effort of the conversation: asking
+// for less effort would cost the prompt cache of the whole conversation.
+const goalCheckTokens = 16000
 
 // GoalVerdict is the answer of a goal check.
 type GoalVerdict struct {
@@ -32,10 +41,10 @@ type GoalVerdict struct {
 // CheckGoal asks the model whether the conversation shows condition met.
 // The request repeats the conversation's own system prompt and tools, so a
 // server's prompt cache covers all but the question, and its answer stays
-// out of the conversation. An answer that can't be read counts as not met.
+// out of the conversation. An answer that can't be read is GoalUnclear.
 func (s *Session) CheckGoal(ctx context.Context, condition string) (GoalVerdict, error) {
 	p, req := s.request(append(slices.Clip(s.History()), provider.TextMessage(provider.RoleUser, prompt.GoalCheck(condition))))
-	req.MaxTokens = 1024
+	req.MaxTokens = goalCheckTokens
 	stream, err := provider.StreamRetry(ctx, p, req, nil)
 	if err != nil {
 		return GoalVerdict{}, err
@@ -91,7 +100,7 @@ func parseVerdict(answer string) (verdict, reason string) {
 	case strings.Contains(lower, `"met"`):
 		return GoalMet, firstSentence(answer)
 	}
-	return GoalNotMet, "the check's answer couldn't be read"
+	return GoalUnclear, "the check's answer couldn't be read"
 }
 
 func firstSentence(s string) string {

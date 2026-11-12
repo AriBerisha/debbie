@@ -33,6 +33,15 @@ const AnthropicVersion = "2026-10-21"
 // which the newest models check their earlier thinking against.
 const thinkingControlsBeta = "thinking-binding-controls-2026-08-01"
 
+// thinkingUpdatesBeta lets a request ask for display "updates": on the
+// newest models the short notes written between tool calls come back as
+// thinking blocks, and this returns their text while reasoning stays hidden.
+const thinkingUpdatesBeta = "thinking-display-updates-2026-08-18"
+
+// interruptedNote is the text of a progress block that stands in for work
+// cut off by the output limit; it is no note to show.
+const interruptedNote = "This part of the response was interrupted before it finished."
+
 // defaultAnthropicMaxTokens is max_tokens when neither the request nor the
 // provider sets one; the API requires it.
 const defaultAnthropicMaxTokens = 32000
@@ -110,10 +119,24 @@ func (a *Anthropic) EffortLevels() []effort.Level {
 	switch {
 	case a.caps != nil:
 		return a.caps.EffortLevels
+	case updatesByName(a.model): // the newest models take xhigh as well
+		return []effort.Level{effort.Low, effort.Medium, effort.High, effort.XHigh, effort.Max}
 	case adaptiveByName(a.model):
 		return []effort.Level{effort.Low, effort.Medium, effort.High, effort.Max}
 	}
 	return nil
+}
+
+// CachesPrefix says side requests should repeat the conversation's prefix.
+func (a *Anthropic) CachesPrefix() bool { return true }
+
+// updates reports whether the model returns its notes between tool calls as
+// thinking blocks, which requests then ask for by themselves (display
+// "updates").
+func (a *Anthropic) updates() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return updatesByName(a.model)
 }
 
 // adaptive reports whether requests turn adaptive thinking on.
@@ -145,6 +168,26 @@ func adaptiveByName(model string) bool {
 		return major >= 5
 	}
 	return major > 4 || major == 4 && minor >= 6
+}
+
+// updatesByName reports whether a model takes display "updates": Opus and
+// Sonnet from 5.5, Fable, and Mythos from 5.1.
+func updatesByName(model string) bool {
+	m := claudeModelRE.FindStringSubmatch(model)
+	if m == nil {
+		return false
+	}
+	major, _ := strconv.Atoi(m[2])
+	minor, _ := strconv.Atoi(m[3])
+	switch m[1] {
+	case "fable":
+		return true
+	case "mythos":
+		return major > 5 || major == 5 && minor >= 1
+	case "opus", "sonnet":
+		return major > 5 || major == 5 && minor >= 5
+	}
+	return false
 }
 
 type anthropicRequest struct {
@@ -234,7 +277,11 @@ func (a *Anthropic) requestBody(req Request) ([]byte, bool, error) {
 	}
 	adaptive := a.adaptive()
 	if adaptive {
-		body.Thinking = &anthropicThinking{Type: "adaptive", Display: "summarized",
+		display := "summarized"
+		if a.updates() {
+			display = "updates"
+		}
+		body.Thinking = &anthropicThinking{Type: "adaptive", Display: display,
 			BlockBinding: &blockBinding{PrefixMismatchBehavior: "drop_block"}}
 	}
 	if levels := a.EffortLevels(); len(levels) > 0 && req.Effort != effort.Default {
@@ -469,7 +516,11 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (Stream, error) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
 	if thinking {
-		httpReq.Header.Set("anthropic-beta", thinkingControlsBeta)
+		beta := thinkingControlsBeta
+		if a.updates() {
+			beta += "," + thinkingUpdatesBeta
+		}
+		httpReq.Header.Set("anthropic-beta", beta)
 	}
 	resp, err := a.client.Do(httpReq)
 	if err != nil {
@@ -484,7 +535,7 @@ func (a *Anthropic) Stream(ctx context.Context, req Request) (Stream, error) {
 		return nil, err
 	}
 	s := &anthropicStream{ctx: ctx, cancel: cancel, body: resp.Body, provider: a.name, redactor: a.redactor,
-		blocks: map[int]*anthropicBlock{}}
+		blocks: map[int]*anthropicBlock{}, notes: thinking && a.updates()}
 	if isJSON(resp.Header.Get("Content-Type")) {
 		s.readWhole() // a proxy that ignored "stream": true
 		return s, nil
@@ -690,6 +741,7 @@ type anthropicStream struct {
 	ended  bool
 	err    error
 	closed bool
+	notes  bool // the request asked for display "updates": thinking text is a note
 }
 
 // anthropicBlock is a content block being streamed.
@@ -855,7 +907,9 @@ func (s *anthropicStream) startBlock(index int, raw json.RawMessage) {
 	case "thinking":
 		if cb.Thinking != "" {
 			b.text.WriteString(cb.Thinking)
-			s.queue = append(s.queue, ReasoningDelta{Text: cb.Thinking})
+			if !s.notes {
+				s.queue = append(s.queue, ReasoningDelta{Text: cb.Thinking})
+			}
 		}
 	case "tool_use":
 		s.queue = append(s.queue, ToolCallStart{ID: cb.ID, Name: cb.Name})
@@ -872,7 +926,9 @@ func (s *anthropicStream) delta(b *anthropicBlock, ev anthropicEvent) {
 	case "thinking_delta":
 		if d.Thinking != "" {
 			b.text.WriteString(d.Thinking)
-			s.queue = append(s.queue, ReasoningDelta{Text: d.Thinking})
+			if !s.notes {
+				s.queue = append(s.queue, ReasoningDelta{Text: d.Thinking})
+			}
 		}
 	case "signature_delta":
 		b.sig.WriteString(d.Signature)
@@ -901,6 +957,9 @@ func (s *anthropicStream) stopBlock(b *anthropicBlock) {
 			Thinking  string `json:"thinking"`
 			Signature string `json:"signature"`
 		}{"thinking", b.text.String(), b.sig.String()})
+		if note := strings.TrimSpace(b.text.String()); s.notes && note != "" && note != interruptedNote {
+			s.queue = append(s.queue, Note{Text: note})
+		}
 		s.queue = append(s.queue, ReasoningEnd{Opaque: block})
 	default: // redacted_thinking, whose start holds all of it, and the rest
 		if len(b.start) > 0 {

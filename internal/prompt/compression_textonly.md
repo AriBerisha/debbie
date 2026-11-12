@@ -1,0 +1,1 @@
+This request comes from the program running this conversation, not from any file or tool result. Stop working for a moment and summarize the conversation, following the instructions below. Answer with text only: don't call any tools.

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"debbie/internal/app"
 	"debbie/internal/provider"
@@ -73,7 +74,7 @@ type Meta struct {
 // conversation, the conversation that replaced it all (after
 // compaction), the mark that web content joined it, which taints a
 // resumed session as it did the first (SPEC §19.5), or a title the user
-// gave it (/rename).
+// gave it (/resume rename).
 type record struct {
 	Type     string        `json:"type"` // "message", "replace", "tainted" or "title"
 	Message  *diskMessage  `json:"message,omitempty"`
@@ -99,6 +100,7 @@ type diskPart struct {
 	IsError bool   `json:"is_error,omitempty"`
 	Images  int    `json:"images,omitempty"` // how many were left out
 	Opaque  string `json:"opaque,omitempty"`
+	Hidden  bool   `json:"hidden,omitempty"`
 }
 
 var kindNames = map[provider.PartKind]string{
@@ -108,7 +110,7 @@ var kindNames = map[provider.PartKind]string{
 func toDisk(m provider.Message) diskMessage {
 	d := diskMessage{Role: string(m.Role)}
 	for _, p := range m.Parts {
-		dp := diskPart{Kind: kindNames[p.Kind], Text: p.Text, Opaque: string(p.Opaque)}
+		dp := diskPart{Kind: kindNames[p.Kind], Text: p.Text, Opaque: string(p.Opaque), Hidden: p.Hidden}
 		if c := p.ToolCall; c != nil {
 			dp.ID, dp.Name, dp.Args = c.ID, c.Name, string(c.Args)
 		}
@@ -123,7 +125,7 @@ func toDisk(m provider.Message) diskMessage {
 func fromDisk(d diskMessage) provider.Message {
 	m := provider.Message{Role: provider.Role(d.Role)}
 	for _, dp := range d.Parts {
-		p := provider.Part{Text: dp.Text}
+		p := provider.Part{Text: dp.Text, Hidden: dp.Hidden}
 		if dp.Opaque != "" {
 			p.Opaque = json.RawMessage(dp.Opaque)
 		}
@@ -406,11 +408,14 @@ func Title(history []provider.Message) string {
 		if m.Role != provider.RoleUser {
 			continue
 		}
-		text := m.Text()
+		text := m.Shown()
 		if i := strings.Index(text, "<attached_file"); i >= 0 {
 			text = text[:i]
 		}
-		text = strings.Join(strings.Fields(text), " ")
+		// A paste from a terminal can start with a rule or a prompt mark.
+		text = strings.TrimLeftFunc(strings.Join(strings.Fields(text), " "), func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '/' && r != '@'
+		})
 		if text == "" {
 			continue
 		}
@@ -458,6 +463,9 @@ func List(dir string) ([]Info, error) {
 	slices.SortFunc(out, func(a, b Info) int { return b.Updated.Compare(a.Updated) })
 	return out, nil
 }
+
+// Describe reads what the file of a session says about it.
+func Describe(path string) (Info, error) { return describe(path) }
 
 // describe reads a session's first line and counts its messages.
 func describe(path string) (Info, error) {

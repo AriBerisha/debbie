@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -33,18 +34,21 @@ func (Glob) Prepare(ctx context.Context, env *Env, args Args) (*Call, error) {
 	if pattern == "" {
 		return nil, fmt.Errorf("the pattern is empty")
 	}
-	dir, base, err := searchDir(env, args.String("path"))
+	dir, base, inside, err := searchDir(env, args.String("path"))
 	if err != nil {
 		return nil, err
 	}
 	call := &Call{Kind: Read, Summary: fmt.Sprintf("glob %s in %s", pattern, base.shown)}
+	if !inside {
+		call.Outside, call.SessionKey = []string{dir}, OutsideReadKey
+	}
 	call.Run = func(ctx context.Context) (Result, error) {
 		type hit struct {
 			rel string
 			mod time.Time
 		}
 		var hits []hit
-		err := env.Workspace.walker().walk(ctx, dir, func(_, rel string, d fs.DirEntry) error {
+		err := searchWalker(env, dir, inside).walk(ctx, dir, func(fileAbs, rel string, d fs.DirEntry) error {
 			if d.IsDir() {
 				return nil
 			}
@@ -53,6 +57,9 @@ func (Glob) Prepare(ctx context.Context, env *Env, args Args) (*Call, error) {
 				var mod time.Time
 				if info, err := d.Info(); err == nil {
 					mod = info.ModTime()
+				}
+				if !inside {
+					rel = filepath.ToSlash(fileAbs) // a path read_file takes
 				}
 				hits = append(hits, hit{rel, mod})
 			}
@@ -86,23 +93,29 @@ type searchBase struct {
 	prefix string // its path relative to the root, with a trailing slash, or ""
 }
 
-// searchDir resolves the directory a search tool works in, which must be in
-// the workspace: .gitignore rules apply to it.
-func searchDir(env *Env, p string) (string, searchBase, error) {
+// searchDir resolves the directory a search tool works in, which may lie
+// outside the workspace: a search there asks like any read outside it.
+func searchDir(env *Env, p string) (string, searchBase, bool, error) {
 	if p == "" {
 		p = "."
 	}
 	abs, inside, err := env.Workspace.Resolve(p)
 	if err != nil {
-		return "", searchBase{}, err
-	}
-	if !inside {
-		return "", searchBase{}, fmt.Errorf("%s is outside the workspace; searches stay inside it", abs)
+		return "", searchBase{}, false, err
 	}
 	rel := env.Workspace.Rel(abs)
 	base := searchBase{shown: rel}
-	if rel != "." {
+	if inside && rel != "." {
 		base.prefix = rel + "/"
 	}
-	return abs, base, nil
+	return abs, base, inside, nil
+}
+
+// searchWalker walks a search: the workspace's walker inside it, and outside
+// it one rooted at the folder searched, whose own .gitignore files apply.
+func searchWalker(env *Env, dir string, inside bool) *walker {
+	if inside {
+		return env.Workspace.walker()
+	}
+	return &walker{root: dir, fold: env.Workspace.fold}
 }

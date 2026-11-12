@@ -27,6 +27,7 @@ const (
 	compactMargin    = 1_024  // room left for the estimate being off
 	charsPerToken    = 4      // the rough size of a token, for estimates
 	slimKeep         = 1_500  // characters kept at each end of a long tool result
+	compactRounds    = 3      // rounds of calls a turn lets pass after compacting
 )
 
 // ErrNothingToCompact is returned for a conversation too short to compact.
@@ -84,9 +85,27 @@ func AutoCompactAt(threshold, contextWindow int) int {
 // room for the summary. progress, if not nil, learns the summary's length
 // as it arrives. The conversation stays as it was if anything fails.
 func (s *Session) Compact(ctx context.Context, focus string, contextWindow int, progress func(chars int)) (CompactResult, error) {
-	history := s.History()
+	compacted, res, err := s.compactMessages(ctx, s.History(), focus, contextWindow, progress)
+	if err != nil {
+		return res, err
+	}
+	s.setHistory(compacted, true)
+	s.afterCompact()
+	return res, nil
+}
+
+// afterCompact forgets what the summary took the place of.
+func (s *Session) afterCompact() {
+	clear(s.callIDs)
+	s.mu.Lock()
+	s.pushSaid, s.noteSaid = false, "" // the notes went with the conversation
+	s.mu.Unlock()
+}
+
+// compactMessages returns the summary that replaces history.
+func (s *Session) compactMessages(ctx context.Context, history []provider.Message, focus string, contextWindow int, progress func(chars int)) ([]provider.Message, CompactResult, error) {
 	if len(history) < 2 {
-		return CompactResult{}, ErrNothingToCompact
+		return nil, CompactResult{}, ErrNothingToCompact
 	}
 	before := EstimateTokens(history)
 	msgs := history
@@ -95,37 +114,161 @@ func (s *Session) Compact(ctx context.Context, focus string, contextWindow int, 
 	}
 	maxOut := compactMaxOutput
 	if contextWindow > 0 {
-		used := EstimateTokens(msgs) + (len(prompt.Compression())+len(prompt.CompressionRequest(focus)))/charsPerToken
+		used := EstimateTokens(msgs) + s.compactOverhead(focus)/charsPerToken
 		maxOut = max(1, min(compactMaxOutput, contextWindow-used-compactMargin))
 	}
-	summary, stop, err := s.summarize(ctx, msgs, prompt.CompressionRequest(focus), maxOut, progress)
+	summary, stop, err := s.summarize(ctx, msgs, prompt.CompressionRequest(focus), maxOut, false, progress)
 	if err == nil && summary == "" && stop != provider.StopRefusal {
 		// A long conversation can fill the reply with the drafting before
 		// the summary starts; asked again, the model writes the summary
 		// alone.
-		summary, stop, err = s.summarize(ctx, msgs, prompt.CompressionRequest(focus)+"\n\n"+prompt.CompressionRetry(), maxOut, progress)
+		summary, stop, err = s.summarize(ctx, msgs, prompt.CompressionRequest(focus)+"\n\n"+prompt.CompressionRetry(), maxOut, true, progress)
 	}
 	switch {
 	case err != nil:
-		return CompactResult{}, err
+		return nil, CompactResult{}, err
 	case summary != "":
 	case stop == provider.StopRefusal:
-		return CompactResult{}, errors.New("the model declined to summarize the conversation; it is unchanged")
+		return nil, CompactResult{}, errors.New("the model declined to summarize the conversation; it is unchanged")
 	case stop == provider.StopMaxTokens:
-		return CompactResult{}, fmt.Errorf("the model's reply reached its output limit (%d tokens) before the summary, twice; the conversation is unchanged", maxOut)
+		return nil, CompactResult{}, fmt.Errorf("the model's reply reached its output limit (%d tokens) before the summary, twice; the conversation is unchanged", maxOut)
 	default:
-		return CompactResult{}, errors.New("the model returned no summary, twice; the conversation is unchanged")
+		return nil, CompactResult{}, errors.New("the model returned no summary, twice; the conversation is unchanged")
 	}
 	compacted := []provider.Message{
 		provider.TextMessage(provider.RoleUser, prompt.CompactedSummary(summary)),
 		provider.TextMessage(provider.RoleAssistant, prompt.CompactionAck()),
 	}
 	if EstimateTokens(compacted) >= before {
-		return CompactResult{Before: before, After: before, Messages: len(history)}, ErrNotSmaller
+		return nil, CompactResult{Before: before, After: before, Messages: len(history)}, ErrNotSmaller
 	}
-	s.setHistory(compacted, true)
-	clear(s.callIDs)
-	return CompactResult{Before: before, After: EstimateTokens(compacted), Messages: len(history)}, nil
+	return compacted, CompactResult{Before: before, After: EstimateTokens(compacted), Messages: len(history)}, nil
+}
+
+// compactOverhead is the size, in characters, of what a summary request
+// carries besides the conversation.
+func (s *Session) compactOverhead(focus string) int {
+	n := len(prompt.Compression()) + len(prompt.CompressionRequest(focus))
+	p, req := s.request(nil)
+	if cachesPrefix(p) {
+		n += len(req.System)
+		for _, t := range req.Tools {
+			n += len(t.Name) + len(t.Description) + len(t.Schema)
+		}
+	}
+	return n
+}
+
+// cachesPrefix reports whether a side request should repeat the
+// conversation's prefix, for the provider's prompt cache.
+func cachesPrefix(p provider.Provider) bool {
+	c, ok := p.(provider.PrefixCacher)
+	return ok && c.CachesPrefix()
+}
+
+// CompactWatcher is a Host that shows a compaction made while a turn runs.
+type CompactWatcher interface {
+	// CompactStart says one started; Compacted always follows it.
+	CompactStart()
+	Compacted(res CompactResult, err error)
+}
+
+// SetAutoCompact says at what context size, in tokens, a turn under way
+// compacts the conversation (0 never), and the context window's size.
+func (s *Session) SetAutoCompact(at, contextWindow int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compactAt, s.compactWindow = at, contextWindow
+}
+
+// compactIfFull compacts the conversation between rounds of calls when the
+// next request would come near the limit: a long turn would otherwise run
+// out of context before it ends.
+//
+// The summary covers what came before the last round of calls. That round,
+// which the model hasn't seen the results of, goes with the message that
+// tells it to carry on, word for word: the results themselves, and what came
+// with them, such as a message from the user or an agent's report. That way
+// nothing it is about to act on depends on a summary.
+//
+// A failure leaves the conversation as it is, and isn't tried again in this
+// turn: the next request may still fit.
+func (t *turn) compactIfFull(ctx context.Context, u *provider.Usage) {
+	s := t.s
+	s.mu.Lock()
+	at, window := s.compactAt, s.compactWindow
+	s.mu.Unlock()
+	n := len(t.msgs)
+	if at <= 0 || t.compactFailed || n < 4 {
+		return
+	}
+	// A limit so low that the system prompt and a round or two reach it
+	// shouldn't cost a summary every round.
+	if t.compactWait > 0 {
+		t.compactWait--
+		return
+	}
+	used := EstimateTokens(t.msgs)
+	if u != nil {
+		// The last reply's real count, and the results it didn't include.
+		used = u.Input + u.Output + EstimateTokens(t.msgs[n-1:])
+	}
+	if used < at {
+		return
+	}
+	w, _ := t.host.(CompactWatcher)
+	if w != nil {
+		w.CompactStart()
+	}
+	compacted, res, err := s.compactMessages(ctx, t.msgs[:n-2], "", window, nil)
+	if err != nil {
+		t.compactFailed = true
+		if w != nil {
+			w.Compacted(res, err)
+		}
+		return
+	}
+	s.afterCompact()
+	carryOn := s.userMessage(prompt.CompressionContinue(lastRound(t.msgs[n-2], t.msgs[n-1])))
+	carryOn.Parts[0].Hidden = true // the user wrote none of it
+	t.msgs = append(compacted, carryOn)
+	t.compactWait = compactRounds
+	s.setHistory(t.msgs, true)
+	if w != nil {
+		w.Compacted(res, nil)
+	}
+}
+
+// lastRound writes out a reply and the results of its calls as text.
+func lastRound(reply, results provider.Message) string {
+	byCall := map[string]*provider.ToolResult{}
+	for _, p := range results.Parts {
+		if p.ToolResult != nil {
+			byCall[p.ToolResult.CallID] = p.ToolResult
+		}
+	}
+	var b strings.Builder
+	if text := strings.TrimSpace(reply.Text()); text != "" {
+		b.WriteString("You wrote:\n" + text + "\n\n")
+	}
+	for _, p := range reply.Parts {
+		c := p.ToolCall
+		if c == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "You called %s with %s, and got:\n", c.Name, c.Args)
+		if r := byCall[c.ID]; r != nil {
+			if r.IsError {
+				b.WriteString("Error: ")
+			}
+			b.WriteString(r.Content + "\n")
+			if len(r.Images) > 0 {
+				b.WriteString("[An image came with it, which was left out; read or take it again if you need it.]\n")
+			}
+		}
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // summarize asks the model once for the summary of msgs, the request as
@@ -133,11 +276,22 @@ func (s *Session) Compact(ctx context.Context, focus string, contextWindow int, 
 // reply ended. The reasoning effort is low where the session sets one: a
 // summary needs no deep thought, and on a model that thinks, thinking
 // shares the output limit with the summary.
-func (s *Session) summarize(ctx context.Context, msgs []provider.Message, request string, maxOut int, progress func(chars int)) (string, provider.StopReason, error) {
-	msgs = append(msgs[:len(msgs):len(msgs)], provider.TextMessage(provider.RoleUser, request))
-	p, req := s.request(msgs)
-	req.System, req.Tools, req.MaxTokens = prompt.Compression(), nil, maxOut
-	if req.Effort != effort.Default {
+//
+// A provider with a prefix cache gets the conversation's own system prompt,
+// tools and effort, and the instructions in the message: the summary then
+// reads the whole conversation from the cache, which is far cheaper. Only a
+// retry lowers the effort there, since that costs the cache.
+func (s *Session) summarize(ctx context.Context, msgs []provider.Message, request string, maxOut int, retry bool, progress func(chars int)) (string, provider.StopReason, error) {
+	p, req := s.request(nil)
+	cached := cachesPrefix(p)
+	if cached {
+		request = prompt.CompressionInline() + "\n\n" + request
+	} else {
+		req.System, req.Tools = prompt.Compression(), nil
+	}
+	req.Messages = append(msgs[:len(msgs):len(msgs)], provider.TextMessage(provider.RoleUser, request))
+	req.MaxTokens = maxOut
+	if req.Effort != effort.Default && (!cached || retry) {
 		req.Effort = effort.Low
 	}
 	stream, err := provider.StreamRetry(ctx, p, req, nil)
@@ -169,7 +323,14 @@ func (s *Session) summarize(ctx context.Context, msgs []provider.Message, reques
 			stop = e.StopReason
 		}
 	}
-	return stripAnalysis(text.String()), stop, nil
+	summary := stripAnalysis(text.String())
+	switch {
+	case stop == provider.StopToolUse, stop == provider.StopMaxTokens, stop == provider.StopFiltered:
+		summary = "" // cut short, or it went on working: no summary to replace a conversation with
+	case cached && !strings.Contains(summary, "<state_snapshot>"):
+		summary = "" // with its tools at hand, it answered something else
+	}
+	return summary, stop, nil
 }
 
 var (

@@ -12,7 +12,7 @@ import (
 )
 
 // providerUsage lists the /provider subcommands (SPEC §6).
-const providerUsage = "/provider list | add | edit <name> | test [name] | trust [name] | use <name> | default <name> | remove <name>"
+const providerUsage = "/provider list | add | edit <name> | test [name] | trust [name] | use <name> | default <name> | remove <name> | workers [provider [model] [effort] | off]"
 
 // said is a line a /provider subcommand said. The fullscreen UI shows them
 // once it is back from line mode, where the subcommands ask their

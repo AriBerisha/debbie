@@ -135,6 +135,15 @@ const powerShellPrefix = "$ProgressPreference='SilentlyContinue';" +
 	"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);" +
 	"$OutputEncoding=[Console]::OutputEncoding;"
 
+// powerShellExit makes the exit code the program's. PowerShell's own is 1
+// whenever $? is false, and Windows PowerShell sets that for a program that
+// only wrote to a redirected stderr: "python -m unittest 2>&1" looked failed
+// when the tests passed. A failed cmdlet keeps its exit code of 1.
+const powerShellExit = "\n$__ok=$?;$__code=$LASTEXITCODE;if(-not $__ok){" +
+	"if($__code){exit $__code};" +
+	"if($null -ne $__code -and $Error[0].FullyQualifiedErrorId -like 'NativeCommandError*'){exit 0};" +
+	"exit 1}"
+
 // command builds the command line itself, since each shell parses it its
 // own way. Commands get their own hidden console: Ctrl+C in the user's
 // console doesn't reach them, a code-page change stays theirs, and they
@@ -149,7 +158,7 @@ func (s *Shell) command(script string) *exec.Cmd {
 		chcp := filepath.Join(systemRoot(), "System32", "chcp.com")
 		line = quoteArg(s.Path) + ` /d /s /c "` + quoteArg(chcp) + ` 65001 >nul 2>&1 & ` + script + `"`
 	case "powershell", "pwsh":
-		line = quoteArg(s.Path) + " -NoLogo -NoProfile -NonInteractive -Command " + quoteArg(powerShellPrefix+script)
+		line = quoteArg(s.Path) + " -NoLogo -NoProfile -NonInteractive -Command " + quoteArg(powerShellPrefix+script+powerShellExit)
 	default:
 		line = quoteArg(s.Path) + " -c " + quoteArg(script)
 	}

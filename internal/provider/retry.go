@@ -105,8 +105,12 @@ func Retryable(err error) bool {
 		switch apiErr.Status {
 		case 429, 500, 502, 503, 504, 529:
 			return true
-		case 0: // inside the stream
-			return apiErr.Type == "overloaded_error" || apiErr.Type == "api_error"
+		case 0: // inside the stream: Anthropic's kinds, and the Responses API's codes
+			switch apiErr.Type {
+			case "overloaded_error", "api_error", "server_error", "rate_limit_exceeded":
+				return true
+			}
+			return false
 		}
 		return false
 	}

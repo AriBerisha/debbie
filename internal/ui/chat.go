@@ -80,7 +80,7 @@ type ChatOptions struct {
 	// each message.
 	History     []string
 	SaveHistory func([]string)
-	// Web is the session's web access, for /web and /browser; nil without
+	// Web is the session's web access, for /web; nil without
 	// tools. ConfirmWebYolo asks the user to confirm web yolo before the
 	// first message; without a yes, web access becomes safe.
 	Web            *browser.Access
@@ -256,8 +256,9 @@ type chat struct {
 	// The goal (goal.go), and how the last turn went.
 	goal, lastGoal *goal
 	turnErr        error
-	unsavedWarned  bool // said that the conversation can't be saved
-	turnTools      int  // tool calls in the turn
+	turnStopped    string // why the agent loop ended the last turn early
+	unsavedWarned  bool   // said that the conversation can't be saved
+	turnTools      int    // tool calls in the turn
 
 	btws []*btwExchange // the side questions asked (btw.go), oldest first
 	mcp  mcpNotes       // MCP news not shown yet, in line mode
@@ -315,6 +316,10 @@ func (c *chat) Subagent(task *agent.ToolRun, s agent.SubagentState) {
 	c.subShown[s.ID] = p
 }
 
+// SubagentHost has no view of a subagent's conversation to give: line mode
+// prints its calls through Subagent.
+func (c *chat) SubagentHost(agent.SubagentState) agent.Host { return nil }
+
 func (c *chat) prompt(continuing bool) {
 	if !c.term.Interactive {
 		return
@@ -333,128 +338,25 @@ func (c *chat) prompt(continuing bool) {
 
 // command runs a slash command and reports whether the user wants to quit.
 func (c *chat) command(cmd string) (quit bool) {
-	name, arg, _ := strings.Cut(cmd, " ")
-	arg = strings.TrimSpace(arg)
-	switch name {
-	case "/quit", "/exit":
-		return true
-	case "/clear":
-		c.opts.Session.Reset()
-		c.lastUsage, c.goal = nil, nil
-		c.r.println(c.st.gray("Conversation cleared."))
-	case "/effort":
-		return c.effortCommand(arg)
-	case "/budget":
-		if msg, ok := reasoningBudget(&c.opts, arg); ok {
-			c.r.println(msg)
-		} else {
-			c.r.println(c.st.yellow(msg))
-		}
-	case "/compact":
-		c.compactCommand(arg)
-	case "/goal":
-		return c.goalCommand(arg)
-	case "/btw":
-		c.btwCommand(arg)
-	case "/mcp":
-		c.r.println(encodeSpans(c.mcpCommand(arg), c.term))
-	case "/autocompact":
-		if arg == "" && c.boxed() && c.openKeys != nil && c.term.columns() >= minSliderColumns {
-			if kb, err := c.openKeys(inputOptions{}); err == nil {
-				quit := c.autoCompactSlider(kb)
-				kb.close()
-				return quit
-			}
-		}
-		if arg == "show" {
-			arg = ""
-		}
-		if msg, ok := autoCompact(&c.opts, arg); ok {
-			c.r.println(msg)
-		} else {
-			c.r.println(c.st.yellow(msg))
-		}
-	case "/mode":
-		return c.modeCommand(arg)
-	case "/model":
-		c.modelCommand(arg)
-	case "/resume":
-		c.resumeCommand(arg)
-	case "/cost":
-		c.costCommand(arg)
-	case "/rename":
-		c.renameCommand(arg)
-	case "/web":
-		msg, ok, yolo := webCommand(&c.opts, arg)
-		if yolo {
-			done, quit := c.confirmWebYolo()
-			if quit {
-				return true
-			}
-			if !done {
-				c.r.println("Web access stays " + c.opts.Web.Mode() + ".")
-			}
-			return false
-		}
-		if ok {
-			c.r.println(msg)
-		} else {
-			c.r.println(c.st.yellow(msg))
-		}
-	case "/browser":
-		if arg == "install" || arg == "setup" {
-			c.browserInstall()
-			break
-		}
-		for _, l := range browserCommand(&c.opts) {
-			c.r.println(l)
-		}
-	case "/browser-install":
-		c.browserInstall()
-	case "/tools":
-		c.toolsCommand()
-	case "/provider":
-		c.providerCommand(arg)
-	case "/help":
-		c.r.println(strings.Join([]string{
-			"/clear            start a new conversation",
-			"/compact [focus]  summarize the conversation to free context",
-			"/autocompact [n]  when it is compacted by itself: tokens, on or off",
-			"/effort [level]   how hard the model reasons: pick on a slider, or give " + effortChoices(c.opts.EffortLevels),
-			"/budget [tokens]  cap how long the model thinks per reply (llama-server): 16k, or auto",
-			"/goal [condition] keep working until a condition is met; /goal clear ends it",
-			"/btw [question]   ask a side question that stays out of the conversation",
-			"@path             in a message, attaches a file; @server:uri an MCP resource",
-			"/mcp [cmd] [name] MCP servers: list; add, remove, enable, disable, reconnect",
-			"/mode [mode]      show or set the approval mode: plan, default, editor, auto or yolo",
-			"/model [id]       switch the model of the provider in use: pick from the server's list, or name one",
-			"/resume [text]    go back to an earlier conversation in this folder; each is saved as it goes",
-			"/rename <name>    name this conversation, for /resume",
-			"/cost [model [in out]] what this session cost, by model; set a model's prices in USD per million tokens",
-			"/web [mode]       show or set web access: off, safe or yolo",
-			"/browser [install] whether Chrome is connected; install sets it up step by step",
-			"/provider ...     list, add, edit, test, trust, use, default or remove providers",
-			"/tools            list the tools the model can use",
-			"/quit             leave (or Ctrl+C twice, or end the input)",
-			"/help             this list",
-			`Enter sends. End a line with \ to continue it, or wrap lines in """ to send them as they are.`,
-		}, "\n"))
-	default:
-		if strings.HasPrefix(name, "/mcp__") && c.opts.MCP != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			text, err := c.opts.MCP.RunPrompt(ctx, name, arg)
-			cancel()
-			if err != nil {
-				c.r.println(c.st.yellow(err.Error()))
-				return false
-			}
-			n := strings.Count(text, "\n") + 1
-			c.r.println(c.st.gray(fmt.Sprintf("  %s sent the MCP prompt's text · %d line%s", c.term.sym().elbow, n, pluralS(n))))
-			return c.turn(text)
-		}
-		c.r.println(c.st.yellow("Unknown command " + name + "; /help lists the commands."))
+	l := &lineCommands{c: c}
+	runCommand(l, cmd)
+	return l.quitting
+}
+
+// runPrompt runs an MCP prompt command: the server's prompt, filled in with
+// the arguments typed, is sent as the user's message. It reports whether
+// the user wants to quit.
+func (c *chat) runPrompt(name, arg string) (quit bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	text, err := c.opts.MCP.RunPrompt(ctx, name, arg)
+	cancel()
+	if err != nil {
+		c.r.println(c.st.yellow(err.Error()))
+		return false
 	}
-	return false
+	n := strings.Count(text, "\n") + 1
+	c.r.println(c.st.gray(fmt.Sprintf("  %s sent the MCP prompt's text · %d line%s", c.term.sym().elbow, n, pluralS(n))))
+	return c.turn(text)
 }
 
 // modeDescriptions explain the approval modes (SPEC §9).
@@ -576,6 +478,8 @@ func (c *chat) effortCommand(arg string) (quit bool) {
 		desc = "the server's default"
 	case l == effort.None:
 		desc = "none (no reasoning)"
+	case l == effort.UltraWorkflow:
+		desc = ultraWorkflowText(sent)
 	case sent != l:
 		desc = fmt.Sprintf("%s, sent as %s, the nearest level the model supports", l, sent)
 	default:
@@ -615,17 +519,21 @@ func (c *chat) effortSlider(kb keyboard) (quit bool) {
 	return false
 }
 
-// effortShown is the reasoning effort requests carry, as the adapter
-// sends it; "" for the server's default.
+// effortShown is the selected effort, or ultraworkflow's local mode name;
+// "" for the server's default.
 func (c *chat) effortShown() string {
 	l := c.opts.Session.Effort()
 	if l == effort.Default {
 		return ""
 	}
+	if l == effort.UltraWorkflow {
+		return string(l)
+	}
 	return string(effort.Fit(l, c.opts.EffortLevels))
 }
 
-// effortChoices lists the levels /effort accepts: the model's, when known.
+// effortChoices lists the levels /effort accepts: the model's, when known,
+// plus the CLI's ultraworkflow mode.
 func effortChoices(levels []effort.Level) string {
 	if len(levels) == 0 {
 		levels = effort.Ladder
@@ -634,7 +542,7 @@ func effortChoices(levels []effort.Level) string {
 	for _, l := range levels {
 		names = append(names, string(l))
 	}
-	return strings.Join(append(names, "default"), ", ")
+	return strings.Join(append(names, string(effort.UltraWorkflow), "default"), ", ")
 }
 
 // turn sends one message and shows what follows. It reports whether the
@@ -655,8 +563,9 @@ func (c *chat) turn(text string) (quit bool) {
 
 	start := time.Now()
 	c.turnTools = 0
+	c.opts.Session.SetAutoCompact(agent.AutoCompactAt(c.opts.AutoCompact, c.opts.Status.ContextWindow), c.opts.Status.ContextWindow)
 	res, err := c.opts.Session.Send(ctx, text, c)
-	c.turnErr = err
+	c.turnErr, c.turnStopped = err, res.Stopped
 	close(done)
 
 	select {
@@ -693,7 +602,7 @@ func (c *chat) turn(text string) (quit bool) {
 	}
 	if u := res.Usage; u != nil && err == nil {
 		if at := agent.AutoCompactAt(c.opts.AutoCompact, c.opts.Status.ContextWindow); at > 0 && u.Input+u.Output >= at {
-			c.r.println(c.st.gray(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/autocompact).", kTokens(u.Input+u.Output))))
+			c.r.println(c.st.gray(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/compact auto).", kTokens(u.Input+u.Output))))
 			c.compactCommand("")
 		}
 	}
@@ -719,8 +628,24 @@ func (c *chat) compactCommand(focus string) {
 		c.r.println(c.st.yellow("Compaction failed: " + err.Error()))
 	default:
 		c.r.println(c.st.gray(fmt.Sprintf("Conversation compacted · %d messages, about %s → %s tokens", res.Messages, kTokens(res.Before), kTokens(res.After))))
-		c.lastUsage = nil
+		c.lastUsage = contextEstimate(res.After)
 	}
+}
+
+// CompactStart shows that a compaction started while a turn runs.
+func (c *chat) CompactStart() { c.r.startSpinner("compacting the conversation") }
+
+// Compacted shows a compaction made while a turn ran.
+func (c *chat) Compacted(res agent.CompactResult, err error) {
+	c.r.stopSpinner()
+	switch {
+	case errors.Is(err, context.Canceled):
+		return
+	case err != nil:
+		c.r.printAbove(c.st.yellow("Compaction failed: " + err.Error()))
+		return
+	}
+	c.r.printAbove(c.st.gray(fmt.Sprintf("Conversation compacted · %d messages, about %s → %s tokens", res.Messages, kTokens(res.Before), kTokens(res.After))))
 }
 
 // The agent.Host methods.

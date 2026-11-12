@@ -37,7 +37,7 @@ func Connect(ctx context.Context, name string, p config.Provider, getenv func(st
 	switch p.Adapter {
 	case config.AdapterAnthropic:
 		return connectClaude(ctx, c, p)
-	case config.AdapterOpenAI:
+	case config.AdapterOpenAI, config.AdapterOpenAIResponses:
 	default:
 		return nil, fmt.Errorf("provider %s uses the %s adapter, which this version doesn't know", name, p.Adapter)
 	}

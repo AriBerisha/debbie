@@ -78,7 +78,7 @@ func browserCommand(args []string, stdout, stderr io.Writer) int {
 			"  4. Check that its ID is %s\n\n"+
 			"It opens https pages on: %s. Its options page (Details, then Extension\n"+
 			"options) adds and removes sites. In a session, /web safe turns web access on;\n"+
-			"/browser then shows whether Chrome is connected. In a session, /browser install does\n"+
+			"/web browser then shows whether Chrome is connected. In a session, /web browser install does\n"+
 			"all this step by step and says when Chrome connects.\n",
 			app.Name, got.Extension, in.HostExe(), in.Where, got.Extension, loaded, got.ID, strings.Join(got.Sites, ", "))
 		return exitOK

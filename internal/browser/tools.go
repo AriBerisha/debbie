@@ -30,7 +30,7 @@ type Access struct {
 	Web      func() config.Web   // the config's web section as it is now
 	Redact   func(string) string // removes the configured secrets
 	Vision   func() bool         // the model sees images: screenshots are offered
-	// Installer makes the installer that /browser install uses; nil for
+	// Installer makes the installer that /web browser install uses; nil for
 	// NewInstaller.
 	Installer func() (*Installer, error)
 
@@ -76,7 +76,7 @@ func (a *Access) Refresh() {
 }
 
 // Install writes the extension and its host and registers the host, as
-// "browser install" does, for /browser install.
+// "browser install" does, for /web browser install.
 func (a *Access) Install() (*Installed, *Installer, error) {
 	newInstaller := a.Installer
 	if newInstaller == nil {
@@ -133,12 +133,12 @@ func (a *Access) call(ctx context.Context, method string, params any) (json.RawM
 	return a.Bridge.Call(ctx, method, params)
 }
 
-// Describe says how web access stands, for /browser.
+// Describe says how web access stands, for /web browser.
 func (a *Access) Describe() []string {
 	mode := a.Mode()
 	if mode == config.WebOff {
 		return []string{"Web access is off: /web safe turns it on, with the browser tools. " +
-			"/browser install sets up the Chrome extension, step by step."}
+			"/web browser install sets up the Chrome extension, step by step."}
 	}
 	lines := []string{"Web access: " + mode + "."}
 	st := a.Bridge.Status()
@@ -151,7 +151,7 @@ func (a *Access) Describe() []string {
 		}
 	case st.Connected && st.Extension.Version != "" && !st.Extension.Current():
 		lines = append(lines, st.Extension.Label()+" is connected, but runs an older copy of the extension: click the reload button on its card in "+
-			"chrome://extensions, or run /browser install, which says when it's done.")
+			"chrome://extensions, or run /web browser install, which says when it's done.")
 	case st.Connected && st.Extension.Version != "":
 		lines = append(lines, fmt.Sprintf("%s is connected (extension %s). It allows: %s.", st.Extension.Label(), st.Extension.Build, siteList(st.Extension.Sites)))
 		if st.Extension.Name == "" {
@@ -160,7 +160,7 @@ func (a *Access) Describe() []string {
 	case st.Connected:
 		lines = append(lines, "Chrome is connected.")
 	default:
-		lines = append(lines, "Waiting for Chrome: is it open, with the extension loaded? /browser install sets it up.")
+		lines = append(lines, "Waiting for Chrome: is it open, with the extension loaded? /web browser install sets it up.")
 	}
 	if a.Session.Tainted() {
 		lines = append(lines, "Web content is in the conversation: in safe mode, edits and commands ask first until /clear.")

@@ -175,7 +175,7 @@ func (m *Manager) Test(ctx context.Context, p Prompter, name string) error {
 	case err != nil:
 		p.Say("  ! the test request failed: " + err.Error())
 		return nil
-	case usage != prov.Options.StreamUsage:
+	case usage != prov.Options.StreamUsage && prov.Adapter == config.AdapterOpenAI: // the Responses API always reports it
 		p.Say(fmt.Sprintf("  ! the server %s token usage now; edit the provider to update options.stream_usage", map[bool]string{true: "reports", false: "doesn't report"}[usage]))
 	default:
 		p.Say("  ✓ streaming works")

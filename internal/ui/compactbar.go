@@ -7,7 +7,7 @@ import (
 	"debbie/internal/agent"
 )
 
-// The /autocompact slider: the effort slider's track, with stops at
+// The /compact auto slider: the effort slider's track, with stops at
 // shares of the model's context window (never at the left), where the
 // conversation is summarized to make room. Enter saves the stop for the
 // provider in use, s keeps it to this session, Esc leaves it.
@@ -114,7 +114,7 @@ func (c *chat) applyAutoCompact(stop effortStop, save bool) []span {
 
 // The fullscreen UI.
 
-// compactPanel is the /autocompact slider.
+// compactPanel is the /compact auto slider.
 type compactPanel struct {
 	s *effortSlider
 }

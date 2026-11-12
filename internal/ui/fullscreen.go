@@ -67,17 +67,20 @@ type fullscreen struct {
 	stripItems []stripItem
 	stripTop   int
 
-	panel        panel              // a dialog above the input box; nil for none
-	under        panel              // the panel an approval covers, shown again after it
-	completion   int                // the highlighted command completion; -1 for none
-	btwCancel    context.CancelFunc // stops the side question being answered
-	frame        int
-	hint         string // a passing message in the status line
-	hintUntil    time.Time
-	lastCtrlC    time.Time
-	showThinking bool  // ctrl+o: thinking and tool output unfolded
-	shown        frame // the last frame drawn
-	done         bool
+	panel      panel              // a dialog above the input box; nil for none
+	under      panel              // the panel an approval covers, shown again after it
+	completion int                // the highlighted command completion; -1 for none
+	btwCancel  context.CancelFunc // stops the side question being answered
+	frame      int
+	hint       string // a passing message in the status line
+	hintUntil  time.Time
+	lastCtrlC  time.Time
+	// When a key last interrupted a turn, and which.
+	interrupted   time.Time
+	interruptedBy string
+	showThinking  bool  // ctrl+o: thinking and tool output unfolded
+	shown         frame // the last frame drawn
+	done          bool
 
 	viewStart int       // the conversation row at the top of the view
 	conv      [][]span  // the conversation's rows at the last frame
@@ -829,6 +832,9 @@ func (f *fullscreen) key(p keyPress) {
 		case p.ctrl('c'):
 			f.copySelection() // with a selection, ctrl+c copies
 			return
+		case p.k == keyEsc && (f.panel == nil || f.noting()):
+			f.sel = selection{} // esc lets go of the selection, not of the turn
+			return
 		case p.k == keyEsc, p.k == keyPgUp, p.k == keyPgDn, p.mod&(modShift|modAlt) != 0 && p.k != keyRune,
 			(p.k == keyHome || p.k == keyEnd) && p.mod&modCtrl != 0:
 			// these keep the selection
@@ -888,7 +894,7 @@ func (f *fullscreen) key(p keyPress) {
 		f.stripFocus = 0 // into the strip of subagents
 	case p.k == keyEsc:
 		if f.busy {
-			f.interrupt()
+			f.interrupt("esc")
 		}
 	case p.k == keyEnter && p.mod == 0:
 		f.submit()
@@ -993,19 +999,31 @@ func (f *fullscreen) scrollBy(n int) {
 	f.scroll = max(0, f.scroll+n)
 }
 
-// ctrlC interrupts a turn, closes a dialog or clears the input box; on an
-// empty box it asks to be pressed again, and pressed again within two
-// seconds it quits.
+// ctrlC closes a dialog, stops the agent on screen, interrupts a turn or
+// clears the input box; on an empty box it asks to be pressed again, and
+// pressed again within two seconds it quits. A turn takes a second press
+// too, since a turn can be long and dear, and Ctrl+C is also what people
+// press to copy, in a terminal that sends it on without a selection; esc
+// interrupts at once.
 func (f *fullscreen) ctrlC() {
 	now := time.Now()
 	switch {
-	case f.busy:
-		f.interrupt()
 	case f.panel != nil:
 		if _, ok := f.panel.(*btwPanel); !ok {
 			f.panel.key(f, keyPress{k: keyEsc})
 		}
 		f.closePanel()
+	case f.viewing != nil && !f.viewing.state.Done && f.viewing.state.Agent != nil:
+		f.viewing.state.Agent.Stop()
+		f.flash("stopping " + f.viewing.state.Description)
+		return
+	case f.busy:
+		if now.Sub(f.lastCtrlC) >= 2*time.Second {
+			f.flash("press ctrl+c again to interrupt · esc interrupts at once")
+			f.lastCtrlC = now
+			return
+		}
+		f.interrupt("ctrl+c")
 	case !f.ed.empty():
 		f.ed.clear()
 		f.flash("cleared · ↑ brings it back · select text to copy it")
@@ -1019,7 +1037,15 @@ func (f *fullscreen) ctrlC() {
 	f.lastCtrlC = time.Time{}
 }
 
-func (f *fullscreen) interrupt() {
+// interrupt stops the turn under way, by the key named. A press that comes
+// right after another, when the first ended a turn and a queued message
+// started the next, was meant for the first.
+func (f *fullscreen) interrupt(by string) {
+	now := time.Now()
+	if now.Sub(f.interrupted) < time.Second && !f.turnStart.Before(f.interrupted) {
+		return
+	}
+	f.interrupted, f.interruptedBy = now, by
 	if f.cancel != nil {
 		f.cancel()
 	}
@@ -1308,6 +1334,7 @@ func (f *fullscreen) startTurn(shown string, prepare func(ctx context.Context) (
 	ctx, cancel := context.WithCancel(context.Background())
 	f.busy, f.cancel, f.turnStart, f.firstDelta, f.deltas, f.activity = true, cancel, time.Now(), time.Time{}, 0, "Thinking"
 	f.turnTools = 0
+	f.opts.Session.SetAutoCompact(f.autoCompactAt(), f.opts.Status.ContextWindow)
 	go func() {
 		text, notes, err := prepare(ctx)
 		if len(notes) > 0 && user != nil {
@@ -1355,13 +1382,17 @@ func (f *fullscreen) finish(res agent.Result, err error) {
 		f.cancel()
 		f.cancel = nil
 	}
-	if a, ok := f.panel.(*approvalPanel); ok {
+	if a, ok := f.panel.(*approvalPanel); ok && a.run.AgentID == 0 {
 		a.answer(agent.Approval{}) // the turn is over; nobody waits for it
 		f.closePanel()
 	}
 	switch {
 	case errors.Is(err, context.Canceled):
-		f.say("Interrupted.", inkYellow)
+		text := "Interrupted."
+		if f.interruptedBy != "" {
+			text = "Interrupted by " + f.interruptedBy + "."
+		}
+		f.say(text, inkYellow)
 	case err != nil:
 		f.say("error: "+errorText(err), inkRed)
 	case res.Stopped != "":
@@ -1375,10 +1406,10 @@ func (f *fullscreen) finish(res agent.Result, err error) {
 		f.say("warning: "+w, inkYellow)
 	}
 	f.lastUsage = append(f.usage(res), f.costPart()...)
-	next := func() { f.goalStep(err) }
+	next := func() { f.goalStep(err, res.Stopped) }
 	if u := res.Usage; u != nil && err == nil {
 		if at := f.autoCompactAt(); at > 0 && u.Input+u.Output >= at {
-			f.say(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/autocompact).", kTokens(u.Input+u.Output)), inkGray)
+			f.say(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/compact auto).", kTokens(u.Input+u.Output)), inkGray)
 			f.compact("", next)
 			return
 		}
@@ -1388,11 +1419,49 @@ func (f *fullscreen) finish(res agent.Result, err error) {
 
 // sendQueued sends the next message typed while a turn ran.
 func (f *fullscreen) sendQueued() {
-	if len(f.queue) > 0 && !f.busy {
+	if f.busy {
+		return
+	}
+	if len(f.queue) > 0 {
 		next := f.queue[0]
 		f.queue = f.queue[1:]
 		f.sendTyped(next)
+		return
 	}
+	// With nothing to send, what background agents reported starts a turn.
+	if report := f.opts.Session.ReportsMessage(); report != "" {
+		f.sendAs("", report)
+	}
+}
+
+// BackgroundDone says a background agent's report waits for the model: it
+// starts a turn, unless one runs, which gets the report by itself.
+func (f *fullscreen) BackgroundDone(description string) {
+	f.post(func() {
+		f.say("Agent finished: "+description, inkGray)
+		f.sendQueued()
+	})
+}
+
+// CompactStart shows that a compaction started while a turn runs.
+func (f *fullscreen) CompactStart() {
+	f.post(func() { f.activity = "Compacting the conversation" })
+}
+
+// Compacted shows a compaction made while a turn ran.
+func (f *fullscreen) Compacted(res agent.CompactResult, err error) {
+	f.post(func() {
+		f.activity = "Thinking"
+		switch {
+		case errors.Is(err, context.Canceled):
+			return
+		case err != nil:
+			f.say("Compaction failed: "+err.Error(), inkYellow)
+			return
+		}
+		f.tr.add(&dividerBlock{text: fmt.Sprintf("Conversation compacted · %d messages, about %s → %s tokens",
+			res.Messages, kTokens(res.Before), kTokens(res.After))})
+	})
 }
 
 // autoCompactAt is the context size at which the conversation is compacted.
@@ -1428,7 +1497,7 @@ func (f *fullscreen) compact(focus string, next func()) {
 			default:
 				f.tr.add(&dividerBlock{text: fmt.Sprintf("Conversation compacted · %d messages, about %s → %s tokens",
 					res.Messages, kTokens(res.Before), kTokens(res.After))})
-				f.lastUsage = nil
+				f.lastUsage = contextEstimate(res.After)
 				f.scroll = 0
 			}
 			if next != nil {
@@ -1456,7 +1525,7 @@ func (f *fullscreen) autoCompactCommand(arg string) {
 	f.say(msg, k)
 }
 
-// autoCompact runs /autocompact for either UI: with no argument it says
+// autoCompact runs /compact auto for either UI: with no argument it says
 // when the conversation is compacted by itself; with a number of tokens
 // (150000 or 150k), on for the default, or off, it changes that and saves
 // it. It returns what to tell the user, and false for a bad argument.
@@ -1625,151 +1694,7 @@ func (f *fullscreen) Approve(ctx context.Context, run *agent.ToolRun) (agent.App
 
 // The commands.
 
-// commandList is what /help lists and the completion offers. subs are a
-// command's subcommands, which the completion offers after its name;
-// words are other words that find it, since the completion also searches
-// what the commands do.
-var commandList = []command{
-	{name: "/autocompact", args: "[tokens|on|off]", about: "when the conversation is compacted by itself",
-		subs:  []subcommand{{"on", "compact by itself, at the default size", false}, {"off", "never compact by itself", false}},
-		words: "context tokens summary size"},
-	{name: "/btw", args: "[question]", about: "ask a side question; /btw alone lists them", words: "aside question"},
-	{name: "/budget", args: "[tokens|auto]", about: "cap how long the model thinks per reply (llama-server): 16k, or auto",
-		words: "thinking reasoning tokens limit"},
-	{name: "/clear", about: "start a new conversation", words: "reset forget new"},
-	{name: "/compact", args: "[focus]", about: "summarize the conversation to free context", words: "shrink tokens summary"},
-	{name: "/effort", args: "[level]", about: "how hard the model reasons: a slider, or a level", words: "thinking reasoning"},
-	{name: "/goal", args: "[condition|clear]", about: "keep working until a condition is met",
-		subs: []subcommand{{"clear", "end the goal", false}}, words: "loop until"},
-	{name: "/help", about: "the commands and keys", words: "keys shortcuts"},
-	{name: "/mcp", args: "[add|remove|enable|disable|reconnect] [name]", about: "the MCP servers: list, add, remove, switch on or off",
-		subs: []subcommand{{"add", "add a server: a command, or a URL", true}, {"add-json", "add a server from its JSON", true},
-			{"remove", "remove a server", true}, {"enable", "switch a server on", true}, {"disable", "switch a server off", true},
-			{"reconnect", "connect to a server again", true}, {"tools", "a server's tools", true}},
-		words: "servers protocol"},
-	{name: "/mode", args: "[mode]", about: "the approval mode: plan, default, editor, auto or yolo; alone, pick one",
-		subs: []subcommand{{"plan", "reads and searches only; the model presents a plan", false},
-			{"default", "asks before edits and commands", false}, {"editor", "edits without asking, runs no commands", false},
-			{"auto", "edits without asking, asks before commands", false}, {"yolo", "runs edits and commands without asking", false}},
-		words: "approval permissions ask"},
-	{name: "/model", args: "[id]", about: "switch the model of the provider in use: pick from the server's list, or name one",
-		words: "switch change pick list"},
-	{name: "/resume", args: "[text]", about: "go back to an earlier conversation in this folder", words: "continue session history load"},
-	{name: "/rename", args: "<name>", about: "name this conversation, for /resume", words: "title session"},
-	{name: "/cost", args: "[model [in out]]", about: "what this session cost, by model; set a model's prices in USD per million tokens",
-		words: "price money spend usage tokens dollars"},
-	{name: "/provider", args: "[subcommand]", about: "list, add, edit, test, trust, use, default or remove providers",
-		subs: []subcommand{{"list", "the providers", false}, {"add", "add a provider, step by step", false},
-			{"edit", "change a provider, vision among it", true}, {"test", "check a provider", true},
-			{"trust", "trust a server's certificate", true}, {"use", "switch to a provider", true},
-			{"default", "the provider sessions start with", true}, {"remove", "remove a provider", true}},
-		words: "model server llama vision"},
-	{name: "/quit", about: "leave (or ctrl+c twice, or ctrl+d)", words: "exit"},
-	{name: "/tools", about: "the tools the model can use"},
-	{name: "/web", args: "[off|safe|yolo]", about: "web access: the browser tools, and whether they ask",
-		subs: []subcommand{{"safe", "the browser tools ask before opening a site", false}, {"off", "no web tools", false},
-			{"yolo", "the browser tools run without asking", false}},
-		words: "internet browser access"},
-	{name: "/browser", args: "[install]", about: "Chrome for the browser tools: is it connected; install sets it up step by step",
-		subs:  []subcommand{{"install", "set up the Chrome extension, step by step", false}},
-		words: "chrome extension setup youtube connect tab"},
-}
-
-// command is a slash command, for /help and the completion.
-type command struct {
-	name, args, about string
-	subs              []subcommand
-	words             string
-}
-
-// subcommand is the first argument a command may take.
-type subcommand struct {
-	name, about string
-	args        bool // more arguments follow
-}
-
-func (f *fullscreen) command(cmd string) {
-	name, arg, _ := strings.Cut(cmd, " ")
-	arg = strings.TrimSpace(arg)
-	switch name {
-	case "/quit", "/exit":
-		f.done = true
-	case "/clear":
-		if f.busy {
-			f.flash("wait for the turn to end, or press esc")
-			return
-		}
-		f.opts.Session.Reset()
-		f.tr.entries = f.tr.entries[:1]
-		f.forgetSubagents()
-		f.lastUsage, f.scroll, f.goal = nil, 0, nil
-		f.scr.redraw()
-	case "/help":
-		f.help()
-	case "/effort":
-		f.effortCommand(arg)
-	case "/budget":
-		msg, ok := reasoningBudget(&f.opts, arg)
-		k := ink{}
-		if !ok {
-			k = inkYellow
-		}
-		f.say(msg, k)
-	case "/mode":
-		f.modeCommand(arg)
-	case "/model":
-		f.modelCommand(arg)
-	case "/resume":
-		f.resumeCommand(arg)
-	case "/cost":
-		f.costCommand(arg)
-	case "/rename":
-		f.renameCommand(arg)
-	case "/web":
-		msg, ok, yolo := webCommand(&f.opts, arg)
-		switch {
-		case yolo:
-			f.confirmWebYolo(false)
-		case ok:
-			f.say(msg, ink{})
-		default:
-			f.say(msg, inkYellow)
-		}
-	case "/browser":
-		if arg == "install" || arg == "setup" {
-			f.browserInstall()
-			return
-		}
-		f.say(strings.Join(browserCommand(&f.opts), "\n"), ink{})
-	case "/browser-install":
-		f.browserInstall()
-	case "/tools":
-		f.toolsList()
-	case "/provider":
-		f.providerCommand(arg)
-	case "/compact":
-		if f.busy {
-			f.flash("wait for the turn to end, or press esc")
-			return
-		}
-		f.compact(arg, nil)
-	case "/autocompact":
-		f.autoCompactCommand(arg)
-	case "/goal":
-		f.goalCommand(arg)
-	case "/btw":
-		f.btwCommand(arg)
-	case "/mcp":
-		f.tr.add(&noteBlock{spans: f.mcpCommand(arg)})
-		f.scroll = 0
-	default:
-		if strings.HasPrefix(name, "/mcp__") && f.opts.MCP != nil {
-			f.runPrompt(name, arg)
-			return
-		}
-		f.say("Unknown command "+name+"; /help lists the commands.", inkYellow)
-	}
-}
+func (f *fullscreen) command(cmd string) { runCommand(screenCommands{f}, cmd) }
 
 func (f *fullscreen) help() {
 	f.tr.add(helpBlock{})
@@ -1779,9 +1704,10 @@ func (f *fullscreen) help() {
 // helpKeys are the keys /help lists after the commands.
 var helpKeys = []string{
 	"Enter sends · alt+enter, ctrl+j or \\ at the end adds a line · ↑↓ history · esc interrupts",
-	"PgUp/PgDn and the wheel scroll · ctrl+o shows thinking and output · ctrl+l redraws · ctrl+c clears, twice quits",
+	"PgUp/PgDn and the wheel scroll · ctrl+o shows thinking and output · ctrl+l redraws · ctrl+c clears, twice interrupts a turn or quits",
 	"shift+tab cycles the approval mode: default, auto-edit, plan (yolo only through /mode yolo)",
 	"@ attaches a file (Tab completes it) · drag to select and copy, double-click a word, triple-click a line",
+	"↓ from an empty box shows the agents: enter opens one, delete stops it, ctrl+c stops the one on screen",
 }
 
 // helpBlock lists the commands in columns that fit the longest name and
@@ -1855,6 +1781,8 @@ func effortText(l effort.Level, levels []effort.Level) string {
 		return "the server's default"
 	case l == effort.None:
 		return "none (no reasoning)"
+	case l == effort.UltraWorkflow:
+		return ultraWorkflowText(sent)
 	case sent != l:
 		return fmt.Sprintf("%s, sent as %s, the nearest level the model supports", l, sent)
 	}

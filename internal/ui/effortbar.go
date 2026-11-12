@@ -15,17 +15,17 @@ import (
 // levels the model supports, Enter saves the level as the provider's
 // default, s applies it to this session only, and Esc leaves the effort as
 // it was. Sparkles gather around the knob as the level rises, and from
-// xhigh up the knob glows. The last stop, ultraworkflow, previews a mode
-// that isn't built yet (several agents at once) and can't be chosen.
+// xhigh up the knob glows. The last stop, ultraworkflow, coordinates several
+// agents at once and has a rainbow track.
 
 // effortStop is a stop on the slider.
 type effortStop struct {
-	name   string
-	level  effort.Level
-	about  string
-	heat   int  // 0 to 6: the sparkles around the knob, and from 4 its glow
-	wip    bool // shown but not chosen: ultraworkflow
-	tokens int  // the auto-compaction slider's stops: the context size
+	name     string
+	level    effort.Level
+	about    string
+	heat     int  // 0 to 6: the sparkles around the knob, and from 4 its glow
+	workflow bool // ultraworkflow's rainbow presentation
+	tokens   int  // the auto-compaction slider's stops: the context size
 }
 
 var effortAbout = map[effort.Level]string{
@@ -54,7 +54,8 @@ func effortStops(levels []effort.Level) []effortStop {
 			stops = append(stops, effortStop{name: string(l), level: l, about: effortAbout[l], heat: effortHeat[l]})
 		}
 	}
-	return append(stops, effortStop{name: "ultraworkflow", about: "several agents working at once, coming soon", heat: 6, wip: true})
+	return append(stops, effortStop{name: string(effort.UltraWorkflow), level: effort.UltraWorkflow,
+		about: "several agents working at once", heat: 6, workflow: true})
 }
 
 // effortSlider is the slider's state.
@@ -69,11 +70,14 @@ type effortSlider struct {
 
 func newEffortSlider(levels []effort.Level, current effort.Level) *effortSlider {
 	s := &effortSlider{stops: effortStops(levels), now: -1, nowName: "the server's default"}
-	if current != effort.Default {
+	if current == effort.UltraWorkflow {
+		s.nowName = string(current)
+		s.now = len(s.stops) - 1
+	} else if current != effort.Default {
 		sent := effort.Fit(current, levels)
 		s.nowName = string(sent)
 		for i, st := range s.stops {
-			if !st.wip && st.level == sent {
+			if !st.workflow && st.level == sent {
 				s.now = i
 			}
 		}
@@ -104,10 +108,6 @@ func (s *effortSlider) key(p keyPress) (done, ok, save bool) {
 	case p.k == keyEnd:
 		move(last)
 	case p.k == keyEnter || p.k == keyRune && (p.r == 's' || p.r == 'S'):
-		if s.stops[s.pos].wip {
-			s.msg = "ultraworkflow isn't built yet: it will run several agents at once. Pick a level to its left."
-			return false, false, false
-		}
 		return true, true, p.k == keyEnter
 	case p.k == keyEsc || p.k == keyRune && (p.r == 'q' || p.r == 'Q'):
 		return true, false, false
@@ -238,7 +238,7 @@ func (s *effortSlider) rows(t Terminal, frame, cols int) [][]span {
 	pulse := 0.5 + 0.5*math.Sin(2*math.Pi*float64(frame)/16)
 	accent := func() rgb { // the color of the chosen stop's name and knob
 		switch {
-		case stop.wip:
+		case stop.workflow:
 			return hue(float64(frame) * 12)
 		case stop.heat >= 4:
 			return gold.mix(warmWhite, pulse)
@@ -260,7 +260,7 @@ func (s *effortSlider) rows(t Terminal, frame, cols int) [][]span {
 	for x := left; x < left+barWidth; x++ {
 		var c rgb
 		switch {
-		case x < knob && stop.wip:
+		case x < knob && stop.workflow:
 			c = hue(float64(x-left)*360/float64(barWidth) + float64(frame)*12)
 		case x < knob:
 			c = logoFrom.mix(tealBright, float64(x-left)/float64(max(1, knob-left)))
@@ -310,7 +310,7 @@ func (s *effortSlider) rows(t Terminal, frame, cols int) [][]span {
 		bright := math.Sin(math.Pi * float64(phase+1) / float64(len(shape)+1))
 		var c rgb
 		switch {
-		case stop.wip:
+		case stop.workflow:
 			c = railGray.mix(hue(float64(h%360)+float64(frame)*9), 0.4+0.6*bright)
 		case stop.heat >= 4 && (h>>24)%3 != 0:
 			c = gold.mix(warmWhite, bright).mix(railGray, 0.5*(1-bright))

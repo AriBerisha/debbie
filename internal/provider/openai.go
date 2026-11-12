@@ -10,8 +10,10 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"debbie/internal/app"
@@ -25,17 +27,25 @@ import (
 const maxErrorBody = 64 << 10
 
 // OpenAI talks to an OpenAI-compatible Chat Completions endpoint, such as
-// llama-server, vLLM, Ollama, LM Studio, OpenAI or Gemini.
+// llama-server, vLLM, Ollama, LM Studio or Gemini (the openai adapter), or
+// to OpenAI's own Responses API (the openai-responses adapter,
+// responses.go), which its newest models need.
 type OpenAI struct {
-	name         string
-	client       *http.Client
-	baseURL      string // without a trailing slash
-	model        string
-	apiKey       string
-	opts         config.ProviderOptions
-	streamIdle   time.Duration
-	redactor     *config.Redactor
+	name       string
+	client     *http.Client
+	baseURL    string // without a trailing slash
+	model      string
+	apiKey     string
+	opts       config.ProviderOptions
+	streamIdle time.Duration
+	redactor   *config.Redactor
+	responses  bool // speak the Responses API rather than Chat Completions
+
+	mu           sync.Mutex     // guards what the server said, which a request may learn
 	effortLevels []effort.Level // what the chat template supports; nil when unknown
+	router       bool           // llama-server's router mode: each model says for itself
+	askedLevels  bool           // the router was asked about the model in use
+	noSummary    bool           // the Responses API refused reasoning summaries
 }
 
 // NewOpenAI returns an adapter for provider p, called name in messages.
@@ -58,18 +68,61 @@ func NewOpenAI(name string, p *config.Provider, apiKey string) (*OpenAI, error) 
 		opts:       p.Options,
 		streamIdle: p.StreamIdle(),
 		redactor:   config.NewRedactor(apiKey),
+		responses:  p.Adapter == config.AdapterOpenAIResponses,
 	}, nil
 }
 
 // Model returns the model that requests ask for.
 func (o *OpenAI) Model() string { return o.model }
 
-// SetModel changes the model that requests ask for.
-func (o *OpenAI) SetModel(model string) { o.model = model }
+// SetModel changes the model that requests ask for. A router's models each
+// have their own levels, so they are asked about again.
+func (o *OpenAI) SetModel(model string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.model = model
+	if o.router {
+		o.effortLevels, o.askedLevels = nil, false
+	}
+}
 
 // SetEffortLevels records the reasoning-effort levels the model supports,
 // weakest first, so requests fit their level to them (see ServerInfo).
-func (o *OpenAI) SetEffortLevels(levels []effort.Level) { o.effortLevels = levels }
+func (o *OpenAI) SetEffortLevels(levels []effort.Level) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.effortLevels = levels
+}
+
+func (o *OpenAI) levels() []effort.Level {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.effortLevels
+}
+
+// learnLevels asks a router about the model just before the first request
+// for it, if ServerInfo couldn't: that request is about to load the model
+// anyway, so asking can't push out one the user didn't mean to replace. Not
+// knowing is no failure: the request then goes out as it would have.
+func (o *OpenAI) learnLevels(ctx context.Context) {
+	o.mu.Lock()
+	ask := o.router && !o.askedLevels && o.model != ""
+	o.askedLevels = o.askedLevels || ask
+	model := o.model
+	o.mu.Unlock()
+	if !ask {
+		return
+	}
+	info, _, err := o.props(ctx, "/props?model="+url.QueryEscape(model))
+	switch {
+	case err == nil:
+		o.SetEffortLevels(info.EffortLevels)
+	case ctx.Err() != nil:
+		o.mu.Lock()
+		o.askedLevels = false // interrupted: the next request asks again
+		o.mu.Unlock()
+	}
+}
 
 type chatRequest struct {
 	Model              string                     `json:"model"`
@@ -131,9 +184,21 @@ func imagePart(img Image) chatPart {
 	p := chatPart{Type: "image_url"}
 	p.ImageURL = &struct {
 		URL string `json:"url"`
-	}{"data:" + img.MediaType + ";base64," + base64.StdEncoding.EncodeToString(img.Data)}
+	}{dataURL(img)}
 	return p
 }
+
+// dataURL is an image as a data: URL, which both of OpenAI's APIs take.
+func dataURL(img Image) string {
+	return "data:" + img.MediaType + ";base64," + base64.StdEncoding.EncodeToString(img.Data)
+}
+
+// imageNote introduces a tool's images, which follow its result in a user
+// message, and imageLeftOut tells the model an older image was dropped
+// (KeptImages).
+func imageNote(callID string) string { return "The image from the tool call " + callID + ":" }
+
+const imageLeftOut = "\n[Its image was left out of the conversation to save context; take a new one to see the page again.]"
 
 type chatTool struct {
 	Type     string       `json:"type"` // "function"
@@ -254,12 +319,12 @@ func chatMessages(system string, msgs []Message, sendReasoning bool) []chatMessa
 				}
 				switch {
 				case len(r.Images) > 0 && kept[r]:
-					images = append(images, chatPart{Type: "text", Text: "The image from the tool call " + r.CallID + ":"})
+					images = append(images, chatPart{Type: "text", Text: imageNote(r.CallID)})
 					for _, img := range r.Images {
 						images = append(images, imagePart(img))
 					}
 				case len(r.Images) > 0:
-					content += "\n[Its image was left out of the conversation to save context; take a new one to see the page again.]"
+					content += imageLeftOut
 				}
 				out = append(out, chatMessage{Role: "tool", ToolCallID: r.CallID, Content: content})
 			}
@@ -302,7 +367,7 @@ func (o *OpenAI) requestBody(req Request) ([]byte, error) {
 		Stream:             true,
 		MaxTokens:          req.MaxTokens,
 		Temperature:        req.Temperature,
-		ReasoningEffort:    string(effort.Fit(req.Effort, o.effortLevels)),
+		ReasoningEffort:    string(effort.Fit(req.Effort, o.levels())),
 		ChatTemplateKwargs: o.opts.ChatTemplateKwargs,
 	}
 	if o.opts.StreamUsage {
@@ -315,15 +380,23 @@ func (o *OpenAI) requestBody(req Request) ([]byte, error) {
 		}
 	}
 	data, err := json.Marshal(body)
-	if err != nil || len(o.opts.ExtraBody) == 0 {
-		return data, err
+	if err != nil {
+		return nil, err
 	}
-	// extra_body adds fields; it never replaces one set above.
+	return withExtraBody(data, o.opts.ExtraBody)
+}
+
+// withExtraBody adds the provider's extra_body fields to a marshalled
+// request. They never replace a field the adapter set.
+func withExtraBody(data []byte, extra map[string]json.RawMessage) ([]byte, error) {
+	if len(extra) == 0 {
+		return data, nil
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return nil, err
 	}
-	for k, v := range o.opts.ExtraBody {
+	for k, v := range extra {
 		if _, set := fields[k]; !set {
 			fields[k] = v
 		}
@@ -333,15 +406,34 @@ func (o *OpenAI) requestBody(req Request) ([]byte, error) {
 
 // Stream sends req and returns the streamed response.
 func (o *OpenAI) Stream(ctx context.Context, req Request) (Stream, error) {
+	if o.responses {
+		return o.streamResponses(ctx, req)
+	}
+	o.learnLevels(ctx)
 	body, err := o.requestBody(req)
 	if err != nil {
 		return nil, err
 	}
+	s, whole, err := o.post(ctx, "/chat/completions", body)
+	if err != nil {
+		return nil, err
+	}
+	if whole {
+		s.readWhole()
+	}
+	return s, nil
+}
+
+// post sends a request to path under the base URL and returns the stream
+// of its response, ready to read; whole says the server answered with
+// plain JSON instead of events (it ignored "stream": true), for the
+// caller to read at once.
+func (o *OpenAI) post(ctx context.Context, path string, body []byte) (s *openAIStream, whole bool, err error) {
 	ctx, cancel := context.WithCancelCause(ctx)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		cancel(nil)
-		return nil, err
+		return nil, false, err
 	}
 	o.setHeaders(httpReq)
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -350,25 +442,24 @@ func (o *OpenAI) Stream(ctx context.Context, req Request) (Stream, error) {
 	if err != nil {
 		err = o.transportError(ctx, err)
 		cancel(nil)
-		return nil, err
+		return nil, false, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		err := o.apiError(resp)
 		resp.Body.Close()
 		cancel(nil)
-		return nil, err
+		return nil, false, err
 	}
 
-	s := &openAIStream{ctx: ctx, cancel: cancel, body: resp.Body, provider: o.name, redactor: o.redactor}
+	s = &openAIStream{ctx: ctx, cancel: cancel, body: resp.Body, provider: o.name, redactor: o.redactor}
 	if isJSON(resp.Header.Get("Content-Type")) {
-		s.readWhole() // the server ignored "stream": true
-		return s, nil
+		return s, true, nil
 	}
 	s.idle = newIdleReader(resp.Body, o.streamIdle, func() {
 		cancel(&IdleError{Provider: o.name, After: o.streamIdle})
 	})
 	s.sse = newSSEReader(s.idle)
-	return s, nil
+	return s, false, nil
 }
 
 // Models lists the models the server offers.
@@ -416,21 +507,84 @@ type ServerInfo struct {
 
 // ServerInfo reads llama-server's GET /props, at the root of the server
 // rather than under /v1. Other servers answer it with an error.
+//
+// In router mode the root says nothing about any model. Asking about one
+// loads it unless told not to, and loading one can push out another, perhaps
+// one the user is working with, so this asks only about a model that is
+// loaded already; else the first request for it does (learnLevels).
 func (o *OpenAI) ServerInfo(ctx context.Context) (ServerInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverRoot(o.baseURL)+"/props", nil)
+	info, role, err := o.props(ctx, "/props")
+	if err != nil || role != "router" {
+		return info, err
+	}
+	o.mu.Lock()
+	o.router, o.askedLevels = true, false
+	model := o.model
+	o.mu.Unlock()
+	if model == "" || !o.modelLoaded(ctx, model) {
+		return info, nil
+	}
+	own, _, err := o.props(ctx, "/props?model="+url.QueryEscape(model)+"&autoload=false")
 	if err != nil {
-		return ServerInfo{}, err
+		return info, nil
+	}
+	o.mu.Lock()
+	o.askedLevels = true
+	o.mu.Unlock()
+	return own, nil
+}
+
+// modelLoaded reports whether a router has a model loaded at the moment.
+func (o *OpenAI) modelLoaded(ctx context.Context, model string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL+"/models", nil)
+	if err != nil {
+		return false
 	}
 	o.setHeaders(req)
 	resp, err := o.client.Do(req)
 	if err != nil {
-		return ServerInfo{}, o.transportError(ctx, err)
+		return false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ServerInfo{}, o.apiError(resp)
+		return false
 	}
 	var body struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Status struct {
+				Value string `json:"value"`
+			} `json:"status"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, maxEventSize)).Decode(&body) != nil {
+		return false
+	}
+	for _, m := range body.Data {
+		if m.ID == model {
+			return m.Status.Value == "loaded"
+		}
+	}
+	return false
+}
+
+// props reads a /props address, and the role the server says it has.
+func (o *OpenAI) props(ctx context.Context, path string) (ServerInfo, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverRoot(o.baseURL)+path, nil)
+	if err != nil {
+		return ServerInfo{}, "", err
+	}
+	o.setHeaders(req)
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return ServerInfo{}, "", o.transportError(ctx, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ServerInfo{}, "", o.apiError(resp)
+	}
+	var body struct {
+		Role                      string `json:"role"`
 		DefaultGenerationSettings struct {
 			NCtx int `json:"n_ctx"`
 		} `json:"default_generation_settings"`
@@ -439,12 +593,12 @@ func (o *OpenAI) ServerInfo(ctx context.Context) (ServerInfo, error) {
 		} `json:"chat_template_caps"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxEventSize)).Decode(&body); err != nil {
-		return ServerInfo{}, fmt.Errorf("%s sent malformed /props: %v", o.name, err)
+		return ServerInfo{}, "", fmt.Errorf("%s sent malformed /props: %v", o.name, err)
 	}
 	return ServerInfo{
 		ContextWindow: body.DefaultGenerationSettings.NCtx,
 		EffortLevels:  body.ChatTemplateCaps.ReasoningEffortLevels,
-	}, nil
+	}, body.Role, nil
 }
 
 // serverRoot strips the API version from a base URL such as
@@ -578,6 +732,13 @@ type openAIStream struct {
 	ended   bool                // Done is queued
 	err     error               // returned once the queue is empty
 	closed  bool
+
+	// For the Responses API (responses.go): its events are handled by
+	// handleResponses, its calls are keyed by their output item's ID, and
+	// a reasoning item's summary comes in parts.
+	responses    bool
+	byItem       map[string]*streamCall
+	summaryParts int
 }
 
 // streamCall is a tool call being assembled from a stream.
@@ -585,6 +746,8 @@ type streamCall struct {
 	id, name string
 	started  bool            // ToolCallStart has been queued
 	pending  strings.Builder // arguments that arrived before the name
+	args     int             // bytes of arguments queued (Responses API)
+	ended    bool            // ToolCallEnd has been queued (Responses API)
 }
 
 func (s *openAIStream) Recv() (Event, error) {
@@ -623,6 +786,9 @@ func (s *openAIStream) Close() error {
 }
 
 func (s *openAIStream) handle(ev sseEvent) error {
+	if s.responses {
+		return s.handleResponses(ev)
+	}
 	if ev.Data == "[DONE]" {
 		s.end()
 		return nil
@@ -779,7 +945,8 @@ func (s *openAIStream) addUsage(chunk chatChunk) {
 
 func (s *openAIStream) end() {
 	for _, c := range s.calls {
-		if c.started {
+		if c.started && !c.ended {
+			c.ended = true
 			s.queue = append(s.queue, ToolCallEnd{ID: c.id})
 		}
 	}

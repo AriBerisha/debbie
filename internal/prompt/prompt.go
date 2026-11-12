@@ -104,6 +104,44 @@ var editorModeText string
 // EditorMode tells the model that editor mode is on (SPEC §9).
 func EditorMode() string { return strings.TrimSpace(editorModeText) }
 
+//go:embed ultraworkflow.md
+var ultraWorkflowText string
+
+// UltraWorkflow pushes the main agent to split substantial work among
+// agents. It reaches the model in a user message, when the mode goes on:
+// the system prompt stays the same through a conversation (SPEC §4.4).
+func UltraWorkflow() string { return strings.TrimSpace(ultraWorkflowText) }
+
+//go:embed agents_note.md
+var agentsNoteText string
+
+//go:embed agents_vision.md
+var agentsVisionText string
+
+//go:embed agents_no_vision.md
+var agentsNoVisionText string
+
+// AgentsNote tells the main agent what its agents run on, which it has no
+// other way to know. Like the push below, it reaches the model in a user
+// message: the system prompt stays the same through a conversation.
+func AgentsNote(on string, parallel int, vision bool) string {
+	atOnce := "one at a time"
+	if parallel > 1 {
+		atOnce = fmt.Sprintf("up to %d at a time", parallel)
+	}
+	sees := agentsNoVisionText
+	if vision {
+		sees = agentsVisionText
+	}
+	return strings.NewReplacer("{on}", on, "{at_once}", atOnce, "{vision}", strings.TrimSpace(sees)).Replace(strings.TrimSpace(agentsNoteText))
+}
+
+//go:embed ultraworkflow_off.md
+var ultraWorkflowOffText string
+
+// UltraWorkflowOff says the push is over.
+func UltraWorkflowOff() string { return strings.TrimSpace(ultraWorkflowOffText) }
+
 // The compaction prompts, ported from Qwen Code's compression service
 // (SPEC §7): the summarizer's system prompt, the request that ends the
 // conversation sent to it, the header and trailer around the summary that
@@ -153,6 +191,25 @@ func CompactionAck() string { return strings.TrimSpace(compressionAckText) }
 // compaction put in place of the conversation before it.
 func IsCompactedSummary(text string) bool {
 	return strings.HasPrefix(text, strings.TrimSpace(compressionSummaryText))
+}
+
+//go:embed compression_textonly.md
+var compressionTextOnlyText string
+
+// CompressionInline is the summarizer's instructions as part of a message,
+// for a request that keeps the conversation's system prompt and tools, so
+// that the provider's prompt cache covers all of it.
+func CompressionInline() string {
+	return strings.TrimSpace(compressionTextOnlyText) + "\n\n" + Compression()
+}
+
+//go:embed compression_continue.md
+var compressionContinueText string
+
+// CompressionContinue carries on a turn that was compacted while it ran,
+// with its last round of calls, which the summary doesn't cover.
+func CompressionContinue(round string) string {
+	return strings.TrimSpace(compressionContinueText) + "\n\n" + round
 }
 
 // CompressionRetry asks again for a summary that didn't come, without the

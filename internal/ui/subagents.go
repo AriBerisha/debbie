@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"debbie/internal/agent"
@@ -44,6 +45,10 @@ func (c *convo) event(ev provider.Event) (text, ok bool) {
 		text = true
 	case provider.ReasoningDelta:
 		b.reasoning.WriteString(c.replyIn.reasoning.Add(e.Text))
+	case provider.Note:
+		// A note comes whole: nothing of it waits for the next piece.
+		in := c.replyIn.reasoning
+		b.notes = append(b.notes, strings.TrimSpace(in.Add(e.Text)+in.End()))
 	default:
 		return false, false
 	}
@@ -277,6 +282,11 @@ func (f *fullscreen) stripKey(p keyPress) bool {
 		f.stripFocus = min(len(list)-1, f.stripFocus+1)
 	case p.k == keyEnter:
 		f.openView(list[min(f.stripFocus, len(list)-1)])
+	case p.k == keyDelete:
+		if v := list[min(f.stripFocus, len(list)-1)]; !v.state.Done && v.state.Agent != nil {
+			v.state.Agent.Stop()
+			f.flash("stopping " + v.state.Description)
+		}
 	case p.k == keyEsc, p.k == keyUp:
 		f.stripFocus = -1
 	default:

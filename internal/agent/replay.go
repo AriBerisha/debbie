@@ -31,7 +31,7 @@ func Replay(history []provider.Message) []Step {
 	}
 	var steps []Step
 	for _, m := range history {
-		text := m.Text()
+		text := m.Shown()
 		switch m.Role {
 		case provider.RoleUser:
 			switch {

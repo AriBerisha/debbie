@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -25,6 +26,11 @@ const (
 	DefaultMaxTurns = 100 // model requests per message
 	maxFailures     = 3   // invalid calls of one kind in a row
 	maxRepeats      = 3   // identical calls, or texts, in a row; one more stops the turn
+
+	// A turn that only reads for this many rounds of calls in a row is told
+	// to act or report; at stallStop it ends, and the user decides.
+	stallNudge = 20
+	stallStop  = 30
 )
 
 // Session is one conversation with a provider.
@@ -53,6 +59,17 @@ type Session struct {
 	ledger   *Ledger         // adds up what the session spends; nil for none
 
 	interjections []string // the user's messages for the turn under way; guarded by mu
+
+	compactAt, compactWindow int // when a turn under way compacts; guarded by mu
+
+	vision    func() bool   // whether the model sees images; nil says yes
+	agentNote func() string // says what agents run on; nil for no note
+	noteSaid  string        // what the model was last told of that; guarded by mu
+
+	noStall   bool     // this session may read as long as it needs: a subagent
+	pushSaid  bool     // the model was last told that ultraworkflow is on; guarded by mu
+	reports   []string // what background agents reported, for the model; guarded by mu
+	reportGen int      // the conversation background agents report to; guarded by mu
 }
 
 // Interject passes a message from the user to the turn under way, which
@@ -78,6 +95,57 @@ func (s *Session) takeInterjections() []string {
 // it.
 func userNote(text string) string {
 	return "[A message from the user, sent while you were working: " + text + "]"
+}
+
+// report keeps what a background agent reported until the model can read
+// it, unless the conversation it belongs to is gone. It says whether it
+// kept it.
+func (s *Session) report(gen int, text string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen != s.reportGen {
+		return false
+	}
+	s.reports = append(s.reports, text)
+	return true
+}
+
+// takeReports returns what background agents reported and forgets it.
+func (s *Session) takeReports() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.reports
+	s.reports = nil
+	return out
+}
+
+// PendingReports says how many reports of background agents wait for the
+// model.
+func (s *Session) PendingReports() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.reports)
+}
+
+// ReportsMessage returns what background agents reported, as a message
+// that starts a turn, and forgets it; "" when there is nothing.
+func (s *Session) ReportsMessage() string {
+	return strings.Join(s.takeReports(), "\n\n")
+}
+
+// generation is the conversation background agents started now report to.
+func (s *Session) generation() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reportGen
+}
+
+// forgetReports ends the conversation background agents report to.
+func (s *Session) forgetReports() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reportGen++
+	s.reports = nil
 }
 
 // New starts a conversation. maxTokens limits each reply; 0 leaves the
@@ -234,12 +302,21 @@ func (s *Session) SetRecorder(r Recorder) { s.recorder = r }
 func (s *Session) Resume(history []provider.Message, tainted bool) {
 	s.mu.Lock()
 	s.history, s.tainted = history, tainted
+	s.pushSaid, s.noteSaid = false, ""
 	s.mu.Unlock()
+	s.forgetReports()
 	clear(s.callIDs)
 	for _, m := range history {
 		for _, p := range m.Parts {
 			if p.ToolCall != nil {
 				s.callIDs[p.ToolCall.ID] = true
+			}
+			if p.Hidden {
+				s.mu.Lock()
+				if text := strings.TrimSpace(p.Text); text == prompt.UltraWorkflow() || text == prompt.UltraWorkflowOff() {
+					s.pushSaid = text == prompt.UltraWorkflow()
+				}
+				s.mu.Unlock()
 			}
 		}
 	}
@@ -251,8 +328,9 @@ func (s *Session) Reset() {
 	s.setHistory(nil, true)
 	clear(s.callIDs)
 	s.mu.Lock()
-	s.tainted = false
+	s.tainted, s.pushSaid, s.noteSaid = false, false, ""
 	s.mu.Unlock()
+	s.forgetReports()
 }
 
 // History returns the conversation so far. The messages are never changed
@@ -300,6 +378,84 @@ func (s *Session) request(msgs []provider.Message) (provider.Provider, provider.
 	return s.provider, req
 }
 
+// userMessage is the user's text as a message, with hidden notes for what
+// changed since the model last heard: what agents run on, and ultraworkflow
+// going on or off. The notes join the conversation instead of the system
+// prompt: changing that would throw away the prompt cache and, on the newest
+// Claude models, earlier thinking.
+func (s *Session) userMessage(text string) provider.Message {
+	msg := provider.TextMessage(provider.RoleUser, text)
+	note := func(n string) {
+		msg.Parts = append(msg.Parts, provider.Part{Kind: provider.PartText, Text: "\n\n" + n, Hidden: true})
+	}
+	// It may read the config, so not under the lock.
+	agents := ""
+	if s.agentNote != nil {
+		agents = s.agentNote()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hasTask := false
+	if s.tools != nil {
+		_, hasTask = s.tools.Lookup("task")
+	}
+	if hasTask && agents != s.noteSaid {
+		s.noteSaid = agents
+		note(agents)
+	}
+	if on := s.effort == effort.UltraWorkflow && hasTask; on != s.pushSaid {
+		s.pushSaid = on
+		if on {
+			note(prompt.UltraWorkflow())
+		} else {
+			note(prompt.UltraWorkflowOff())
+		}
+	}
+	return msg
+}
+
+// SetAgentNote sets what says, in a note to the model, what its agents run
+// on; the model hears it again when it changes.
+func (s *Session) SetAgentNote(note func() string) { s.agentNote = note }
+
+// SetVision sets what says whether the model sees images.
+func (s *Session) SetVision(vision func() bool) { s.vision = vision }
+
+// What bounds the images a conversation carries, each request repeating them.
+// Claude's API takes 100 images per request on models with 200k of context,
+// more on others, and 128 MB per request, base64 included, of which this
+// makes about 85.
+const (
+	maxConversationImages     = 100
+	maxConversationImageBytes = 64 << 20
+)
+
+// refuseImages says why images a tool returned can't go to the model, "" when
+// they can.
+func (t *turn) refuseImages(images []provider.Image) string {
+	if v := t.s.vision; v != nil && !v() {
+		return "This model can't see images, so the image wasn't sent. Say so rather than guessing what it shows."
+	}
+	count, total := len(images), 0
+	for _, img := range images {
+		total += len(img.Data)
+	}
+	for _, m := range t.msgs {
+		for _, p := range m.Parts {
+			if p.ToolResult != nil {
+				count += len(p.ToolResult.Images)
+				for _, img := range p.ToolResult.Images {
+					total += len(img.Data)
+				}
+			}
+		}
+	}
+	if count > maxConversationImages || total > maxConversationImageBytes {
+		return "The conversation already carries as many images as a request can take, so this one wasn't sent. The user can free them with /compact."
+	}
+	return ""
+}
+
 // Available reports whether tools of a kind may run in the current mode:
 // plan mode only reads, and editor mode runs no commands.
 func (s *Session) Available(k tools.Kind) bool {
@@ -331,12 +487,15 @@ var errRepeating = errors.New("the reply keeps repeating itself")
 // until a reply makes no calls. Everything the model said and did joins the
 // history, even when the turn broke off, by cancellation or an error, so
 // the user can ask the model to continue; the error is returned with the
-// result. A turn in which the model said nothing at all leaves the history
-// unchanged, so the user can simply send the message again.
+// result. A turn that failed before the model said anything leaves the
+// history unchanged, so the user can simply send the message again.
 func (s *Session) Send(ctx context.Context, text string, host Host) (Result, error) {
-	t := &turn{s: s, host: host, msgs: append(slices.Clip(s.History()), provider.TextMessage(provider.RoleUser, text))}
+	t := &turn{s: s, host: host, msgs: append(slices.Clip(s.History()), s.userMessage(text))}
 	res, err := t.run(ctx)
-	if t.produced {
+	// A message interrupted before the model said anything stays: what the
+	// user sends next, such as "continue", makes no sense without it. After
+	// an error the user sends it again.
+	if t.produced || ctx.Err() != nil {
 		s.setHistory(t.msgs, false)
 	}
 	return res, err
@@ -356,6 +515,11 @@ type turn struct {
 	failKind    string // the kind of the previous invalid calls
 	failures    int
 	notes       []string // loop warnings to send with the next tool results
+	stall       int      // rounds of calls in a row that only read
+	acted       atomic.Bool
+
+	compactFailed bool // a compaction failed in this turn
+	compactWait   int  // rounds of calls before it may compact again
 }
 
 func (t *turn) run(ctx context.Context) (Result, error) {
@@ -397,6 +561,13 @@ func (t *turn) run(ctx context.Context) (Result, error) {
 			for _, n := range notes {
 				last.Content += "\n\n" + userNote(n)
 			}
+			t.stall = 0 // the user just spoke
+		}
+		if reports := t.s.takeReports(); len(reports) > 0 {
+			last := results.Parts[len(results.Parts)-1].ToolResult
+			for _, r := range reports {
+				last.Content += "\n\n" + r
+			}
 		}
 		t.msgs = append(t.msgs, results)
 		t.s.record(t.msgs, false) // saved as it goes, should the program end mid-turn
@@ -406,6 +577,10 @@ func (t *turn) run(ctx context.Context) (Result, error) {
 		if stop != "" {
 			res.Stopped = stop
 			return res, nil
+		}
+		t.compactIfFull(ctx, r.usage)
+		if err := ctx.Err(); err != nil {
+			return res, err
 		}
 	}
 }
@@ -532,6 +707,13 @@ func (t *turn) reply(ctx context.Context) (reply, error) {
 				finish()
 				return r, errRepeating
 			}
+		case provider.Note:
+			// Its thinking block comes next, with the note's text in it.
+			grow(provider.PartReasoning, e.Text)
+			if chant.reasoning(e.Text) {
+				finish()
+				return r, errRepeating
+			}
 		case provider.ReasoningEnd:
 			thought := ""
 			if runKind == provider.PartReasoning {
@@ -593,6 +775,28 @@ func (t *turn) checkText(text string) string {
 	return ""
 }
 
+// checkStall watches for a model that keeps reading without acting or
+// answering: it tells it to act or report, and if that changes nothing it
+// ends the turn, for the user to decide. It returns stop, or the reason.
+func (t *turn) checkStall(stop string) string {
+	if t.s.noStall {
+		return stop
+	}
+	if t.acted.Swap(false) {
+		t.stall = 0
+		return stop
+	}
+	t.stall++
+	switch {
+	case t.stall >= stallStop && stop == "":
+		return fmt.Sprintf("%d rounds of tool calls that only read, without changing anything. Send \"continue\" to let it go on, or say what you want instead", t.stall)
+	case t.stall == stallNudge:
+		t.notes = append(t.notes, fmt.Sprintf("[Note: you have made %d rounds of tool calls that only read, without changing anything or telling the user what you found. "+
+			"You likely know enough: act on it, or end your turn by telling the user what you found and what you need from them. %d more rounds like this stop the turn.]", stallNudge, stallStop-stallNudge))
+	}
+	return stop
+}
+
 // outcome is what a tool call gives the model.
 type outcome struct {
 	content string
@@ -624,6 +828,7 @@ func (t *turn) runCalls(ctx context.Context, calls []provider.ToolCall, stop str
 		}
 		i += n
 	}
+	stop = t.checkStall(stop)
 	for i, c := range calls {
 		msg.Parts = append(msg.Parts, provider.Part{Kind: provider.PartToolResult,
 			ToolResult: &provider.ToolResult{CallID: c.ID, Content: out[i].content, IsError: out[i].isErr, Images: out[i].images}})
@@ -778,6 +983,7 @@ func (t *turn) prepare(ctx context.Context, c provider.ToolCall) (p *prepared, c
 			run.Status = RunDenied
 			t.host.ToolEnd(run)
 			if note := strings.TrimSpace(ans.Note); note != "" {
+				t.acted.Store(true) // the user just spoke
 				return nil, "The user declined this call and said: " + note, true, ""
 			}
 			return nil, "The user declined this call.", true, "you declined a tool call"
@@ -799,8 +1005,16 @@ func (t *turn) exec(ctx context.Context, p *prepared, hostMu *sync.Mutex) outcom
 	var isErr bool
 	var images []provider.Image
 	s, run := t.s, p.run
+	if p.call.Kind != tools.Read && !p.call.OnlyLooks || run.Name == "task" || run.Name == "ask_user" {
+		t.acted.Store(true)
+	}
 	start := time.Now()
 	out, err := p.call.Run(withCall(ctx, t.host, run))
+	if err == nil && len(out.Images) > 0 {
+		if why := t.refuseImages(out.Images); why != "" {
+			out, err = tools.Result{}, errors.New(why)
+		}
+	}
 	run.Elapsed = time.Since(start)
 	switch {
 	case ctx.Err() != nil:

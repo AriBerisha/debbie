@@ -64,7 +64,7 @@ func (e *ErrBusy) Error() string {
 
 // ErrNotConnected is returned while no extension is connected.
 var ErrNotConnected = errors.New("the Chrome extension isn't connected: install it with \"" + app.Name +
-	" browser install\", load it in Chrome, and see /browser")
+	" browser install\", load it in Chrome, and see /web browser")
 
 // Bridge is the session's end of the browser bridge (SPEC §20.3): a Unix
 // socket in a private directory, which the native host Chrome starts
@@ -192,7 +192,7 @@ func (b *Bridge) Stop() {
 	}
 }
 
-// Status describes the bridge, for /browser.
+// Status describes the bridge, for /web browser.
 type Status struct {
 	Started   bool
 	Connected bool

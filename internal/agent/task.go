@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"debbie/internal/effort"
 	"debbie/internal/prompt"
 	"debbie/internal/provider"
 	"debbie/internal/tools"
@@ -21,7 +22,7 @@ import (
 // subagent: a session of its own, with a fresh history, the subagent system
 // prompt and the tools its kind allows, never task itself. It works under
 // the same approval mode, its approval prompts name it, and its last reply
-// is the tool's result.
+// is the tool's result, or, in the background, reaches the model by itself.
 
 // maxSubagentAnswer caps, in characters, the reply the parent agent gets.
 const maxSubagentAnswer = 8000
@@ -33,6 +34,7 @@ type SubagentState struct {
 	Prompt      string    // its task
 	Agent       *Subagent // to talk to it
 	Full        bool      // it may edit files and run commands, not only read
+	Background  bool      // the conversation carries on while it works
 	Waiting     bool      // for a free slot: subagents.max_parallel run at once
 	Started     time.Time // when it got its slot
 	Calls       []SubagentCall
@@ -58,6 +60,15 @@ type SubagentWatcher interface {
 	// conversation, its replies and calls, as it starts; nil for none.
 	// Its Approve isn't used: approvals go to the main host.
 	SubagentHost(s SubagentState) Host
+}
+
+// BackgroundHost is a Host that can run agents in the background: it stays
+// able to ask for approvals between turns, and starts a turn for a report
+// that comes while none runs. Any other host runs them while the call waits.
+type BackgroundHost interface {
+	// BackgroundDone says a background agent's report waits for the model
+	// (Session.ReportsMessage). It is called from the agent's goroutine.
+	BackgroundDone(description string)
 }
 
 // Subagent is a subagent the user can talk to and stop.
@@ -87,13 +98,11 @@ func (a *Subagent) Tell(text string) {
 	a.cancel = cancel
 	go func() {
 		defer cancel()
-		select {
-		case a.tool.slots <- struct{}{}:
-		case <-ctx.Done():
+		if err := a.tool.acquire(ctx); err != nil {
 			a.idle()
 			return
 		}
-		defer func() { <-a.tool.slots }()
+		defer a.tool.gate.release()
 		a.host.restart()
 		_, err := a.answer(ctx, "")
 		a.host.end(stopReason(ctx, err))
@@ -192,24 +201,51 @@ func (refusingHost) Approve(context.Context, *ToolRun) (Approval, error) {
 	return Approval{}, errors.New("no one to ask")
 }
 
+// Workers is what agents run on at the moment, which the user may change
+// while the session runs (/provider workers).
+type Workers struct {
+	Provider  provider.Provider // nil: the conversation's
+	MaxTokens int               // the output limit of Provider
+	// Effort is how hard they reason; effort.Default is the conversation's
+	// at most medium: they do bounded work, and their reports are checked.
+	Effort   effort.Level
+	Parallel int  // how many run at once
+	Vision   bool // Provider's model sees images; with no Provider, the conversation's rule applies
+	// CompactAt and ContextWindow are when an agent on Provider compacts its
+	// conversation, and the size of its context; with no Provider, the
+	// conversation's apply.
+	CompactAt, ContextWindow int
+}
+
+// workerEffort is how hard the conversation's reasoning level has agents
+// reason, unless the workers set their own.
+const workerEffort = effort.Medium
+
 // TaskTool is the task tool of a session.
 type TaskTool struct {
 	parent   *Session
 	system   func(full bool) string
-	provider func() (provider.Provider, int, error) // nil: the parent's
+	workers  func() (Workers, error)
 	maxTurns int
-	slots    chan struct{} // one per subagent running
-	approve  sync.Mutex    // one subagent's approval prompt at a time
+	gate     slotGate
+	approve  sync.Mutex // one subagent's approval prompt at a time
 	ids      atomic.Int64
 }
 
 // NewTaskTool returns the task tool of parent. system writes a subagent's
-// system prompt. prov, unless nil, returns the provider subagents use
-// (subagents.provider) and its output limit; else they use the parent's.
-// At most maxParallel subagents run at once, each for at most maxTurns
-// requests.
-func NewTaskTool(parent *Session, system func(full bool) string, prov func() (provider.Provider, int, error), maxParallel, maxTurns int) *TaskTool {
-	return &TaskTool{parent: parent, system: system, provider: prov, maxTurns: max(1, maxTurns), slots: make(chan struct{}, max(1, maxParallel))}
+// system prompt; workers says what they run on, read as each one starts;
+// each runs for at most maxTurns requests.
+func NewTaskTool(parent *Session, system func(full bool) string, workers func() (Workers, error), maxTurns int) *TaskTool {
+	return &TaskTool{parent: parent, system: system, workers: workers, maxTurns: max(1, maxTurns)}
+}
+
+// acquire waits for a free slot.
+func (t *TaskTool) acquire(ctx context.Context) error {
+	w, err := t.workers()
+	if err != nil {
+		return err
+	}
+	return t.gate.acquire(ctx, max(1, w.Parallel))
 }
 
 func (t *TaskTool) Name() string        { return "task" }
@@ -219,8 +255,9 @@ func (t *TaskTool) Description() string { return prompt.Tool("task") }
 func (t *TaskTool) Params() []tools.Param {
 	return []tools.Param{
 		{Name: "description", Type: "string", Required: true, Description: "A short (3-5 word) description of the task, shown to the user"},
-		{Name: "prompt", Type: "string", Required: true, Description: "The task for the subagent, with everything it needs to know: it doesn't see this conversation"},
+		{Name: "prompt", Type: "string", Required: true, Description: "The task for the agent, with everything it needs to know: it doesn't see this conversation"},
 		{Name: "tools", Type: "string", Description: `"read-only" (the default): it can read and search files; "full": it can also edit files and run commands`},
+		{Name: "background", Type: "boolean", Description: "true returns at once and you carry on; the report reaches you by itself when the agent finishes"},
 	}
 }
 
@@ -232,7 +269,7 @@ func (t *TaskTool) Prepare(_ context.Context, _ *tools.Env, args tools.Args) (*t
 	case desc == "":
 		return nil, errors.New("description is empty: give the task a few words that the user sees")
 	case task == "":
-		return nil, errors.New("prompt is empty: give the subagent its task in full")
+		return nil, errors.New("prompt is empty: give the agent its task in full")
 	case kind == "":
 		kind = "read-only"
 	case kind != "read-only" && kind != "full":
@@ -241,27 +278,64 @@ func (t *TaskTool) Prepare(_ context.Context, _ *tools.Env, args tools.Args) (*t
 	if utf8.RuneCountInString(desc) > 60 {
 		desc = string([]rune(desc)[:60]) + "…"
 	}
-	full := kind == "full"
-	return &tools.Call{Kind: tools.Read, Summary: "task " + desc + " · " + kind,
-		Run: func(ctx context.Context) (tools.Result, error) { return t.run(ctx, desc, task, full) }}, nil
+	full, background := kind == "full", args.Bool("background")
+	summary := "task " + desc + " · " + kind
+	if background {
+		summary += " · background"
+	}
+	return &tools.Call{Kind: tools.Read, Summary: summary,
+		Run: func(ctx context.Context) (tools.Result, error) { return t.run(ctx, desc, task, full, background) }}, nil
 }
 
-// run starts a subagent, once a slot is free, and returns its answer.
-func (t *TaskTool) run(ctx context.Context, desc, task string, full bool) (tools.Result, error) {
+// run starts a subagent, once a slot is free, and returns its answer; in
+// the background it returns at once, and the answer reaches the model by
+// itself.
+func (t *TaskTool) run(ctx context.Context, desc, task string, full, background bool) (tools.Result, error) {
 	host, run := callFrom(ctx)
 	sub, err := t.session(full)
 	if err != nil {
 		return tools.Result{}, err
 	}
+	bg, canBG := host.(BackgroundHost)
+	background = background && canBG
 	id := int(t.ids.Add(1))
 	h := &subHost{parent: host, task: run, desc: desc, id: id, approve: &t.approve}
 	a := &Subagent{tool: t, sub: sub, host: h, busy: true}
-	h.state = SubagentState{ID: id, Description: desc, Prompt: task, Agent: a, Full: full, Waiting: true}
+	h.state = SubagentState{ID: id, Description: desc, Prompt: task, Agent: a, Full: full, Background: background, Waiting: true}
 	if w, ok := host.(SubagentWatcher); ok {
 		h.watch = w
 		h.show = w.SubagentHost(h.state)
 	}
 	h.update()
+	if background {
+		// Its context isn't the turn's: the turn may end long before it does.
+		bctx, cancel := context.WithCancel(context.Background())
+		a.mu.Lock()
+		a.cancel = cancel
+		a.mu.Unlock()
+		gen := t.parent.generation()
+		go func() {
+			defer cancel()
+			out, err := t.work(bctx, a, h, task)
+			report := fmt.Sprintf("[Background agent %d, %q, finished. Its report:\n\n%s]", id, desc, out.Output)
+			switch {
+			case bctx.Err() != nil:
+				report = fmt.Sprintf("[The user stopped background agent %d, %q, before it finished.]", id, desc)
+			case err != nil:
+				report = fmt.Sprintf("[Background agent %d, %q, failed: %s]", id, desc, t.parent.redact(err.Error()))
+			}
+			if out.Tainted {
+				t.parent.taint()
+			}
+			if t.parent.report(gen, report) {
+				bg.BackgroundDone(desc)
+			}
+		}()
+		return tools.Result{
+			Output:  fmt.Sprintf("Agent %d started in the background. Its report reaches you by itself when it finishes, so don't wait or poll for it: carry on with other work, or end your turn.", id),
+			Display: "in the background",
+		}, nil
+	}
 	// Its own context, so the user can stop it alone.
 	turn := ctx
 	ctx, cancel := context.WithCancel(ctx)
@@ -269,31 +343,42 @@ func (t *TaskTool) run(ctx context.Context, desc, task string, full bool) (tools
 	a.mu.Lock()
 	a.cancel = cancel
 	a.mu.Unlock()
-	select {
-	case t.slots <- struct{}{}:
-	case <-ctx.Done():
-		a.idle()
-		h.end("stopped before it started")
-		return tools.Result{}, ctx.Err()
+	out, err := t.work(ctx, a, h, task)
+	if err != nil {
+		if ctx.Err() != nil && turn.Err() == nil {
+			// The user stopped this subagent, not the turn.
+			return tools.Result{Output: "The user stopped this agent before it finished."}, nil
+		}
+		return tools.Result{}, err
 	}
-	defer func() { <-t.slots }()
+	return out, nil
+}
+
+// work waits for a free slot and runs the subagent's task, ending its state.
+func (t *TaskTool) work(ctx context.Context, a *Subagent, h *subHost, task string) (tools.Result, error) {
+	if err := t.acquire(ctx); err != nil {
+		a.idle()
+		if ctx.Err() != nil {
+			h.end("stopped before it started")
+			return tools.Result{}, ctx.Err()
+		}
+		h.end(err.Error())
+		return tools.Result{}, err
+	}
+	defer t.gate.release()
 	h.restart()
 
 	res, err := a.answer(ctx, task)
 	if err != nil {
 		h.end(stopReason(ctx, err))
-		if ctx.Err() != nil && turn.Err() == nil {
-			// The user stopped this subagent, not the turn.
-			return tools.Result{Output: "The user stopped this subagent before it finished."}, nil
-		}
 		return tools.Result{}, err
 	}
 	answer := strings.TrimSpace(res.Text)
 	if answer == "" {
-		answer = "(The subagent ended without an answer.)"
+		answer = "(The agent ended without an answer.)"
 	}
 	if res.Stopped != "" {
-		answer += "\n\n[The subagent stopped early: " + res.Stopped + ". This is what it had found.]"
+		answer += "\n\n[The agent stopped early: " + res.Stopped + ". This is what it had found.]"
 	}
 	if utf8.RuneCountInString(answer) > maxSubagentAnswer {
 		answer = string([]rune(answer)[:maxSubagentAnswer]) + "\n\n[The answer was cut at 8,000 characters.]"
@@ -305,22 +390,37 @@ func (t *TaskTool) run(ctx context.Context, desc, task string, full bool) (tools
 	return tools.Result{Output: answer, Display: tools.Count(calls, "call", "calls"), Tainted: a.sub.Tainted()}, nil
 }
 
-// session makes the subagent's session: the parent's provider, output
-// limit, mode, effort, reasoning budget and session approvals, unless
-// subagents have a provider of their own; and the tools its kind allows.
+// session makes the subagent's session: the provider, output limit and
+// effort the workers have, or else the parent's provider and limit and its
+// effort at most at workerEffort; the parent's mode, reasoning budget and
+// session approvals; and the tools its kind allows.
 func (t *TaskTool) session(full bool) (*Session, error) {
 	p := t.parent
 	p.mu.Lock()
 	prov, maxTokens, mode, level, budget, web, tainted := p.provider, p.maxTokens, p.mode, p.effort, p.budget, p.web, p.tainted
+	compactAt, compactWindow := p.compactAt, p.compactWindow
 	p.mu.Unlock()
-	if t.provider != nil {
-		var err error
-		if prov, maxTokens, err = t.provider(); err != nil {
-			return nil, fmt.Errorf("the subagents' provider: %w", err)
-		}
+	w, err := t.workers()
+	if err != nil {
+		return nil, fmt.Errorf("the agents' provider: %w", err)
+	}
+	if w.Provider != nil {
+		prov, maxTokens, compactAt, compactWindow = w.Provider, w.MaxTokens, w.CompactAt, w.ContextWindow
+	}
+	if w.Effort != effort.Default {
+		level = w.Effort
+	} else {
+		level = effort.AtMost(level, workerEffort)
 	}
 	sub := New(prov, t.system(full), maxTokens)
 	sub.mode, sub.effort, sub.budget, sub.redact, sub.maxTurns = mode, level, budget, p.redact, t.maxTurns
+	sub.noStall = true // it has maxTurns, and reading may be its whole task
+	sub.compactAt, sub.compactWindow = compactAt, compactWindow
+	sub.vision = p.vision
+	if w.Provider != nil {
+		sees := w.Vision
+		sub.vision = func() bool { return sees }
+	}
 	sub.ledger = p.ledger // its spend is the session's
 	// Its task may carry what a page said: the parent's taint goes along.
 	sub.web, sub.tainted = web, tainted
@@ -344,6 +444,63 @@ func subagentTools(reg *tools.Registry, full bool) *tools.Registry {
 		}
 	}
 	return sub
+}
+
+// slotGate limits how many subagents work at once. The limit comes with
+// each acquire, since the provider they run on can change: one that waits
+// goes first when a slot frees below its limit.
+type slotGate struct {
+	mu      sync.Mutex
+	running int
+	waiting []*slotWaiter
+}
+
+type slotWaiter struct {
+	limit int
+	ready chan struct{}
+}
+
+func (g *slotGate) acquire(ctx context.Context, limit int) error {
+	g.mu.Lock()
+	if g.running < limit && len(g.waiting) == 0 {
+		g.running++
+		g.mu.Unlock()
+		return nil
+	}
+	w := &slotWaiter{limit: limit, ready: make(chan struct{})}
+	g.waiting = append(g.waiting, w)
+	g.mu.Unlock()
+	select {
+	case <-w.ready:
+		return nil
+	case <-ctx.Done():
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		select {
+		case <-w.ready: // it got the slot just then
+			g.running--
+			g.wake()
+		default:
+			g.waiting = slices.DeleteFunc(g.waiting, func(o *slotWaiter) bool { return o == w })
+		}
+		return ctx.Err()
+	}
+}
+
+func (g *slotGate) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.running--
+	g.wake()
+}
+
+// wake gives free slots to those waiting, in order.
+func (g *slotGate) wake() {
+	for len(g.waiting) > 0 && g.running < g.waiting[0].limit {
+		close(g.waiting[0].ready)
+		g.waiting = g.waiting[1:]
+		g.running++
+	}
 }
 
 // subHost is the host of a subagent's session. Its replies aren't shown;

@@ -150,9 +150,11 @@ func (b *userBlock) draw(width int, t Terminal) [][]span {
 }
 
 // replyBlock is one reply of the model: what it thought, folded once it
-// answers, and its answer in Markdown.
+// answers; the notes it wrote between tool calls, one plain line each; and
+// its answer in Markdown.
 type replyBlock struct {
 	reasoning, text strings.Builder
+	notes           []string
 	started         time.Time
 	thought         time.Duration // how long it thought, once it answers
 	done            bool
@@ -184,6 +186,9 @@ func (b *replyBlock) draw(width int, t Terminal) [][]span {
 			}
 			rows = append(rows, lines...)
 		}
+	}
+	for _, n := range b.notes {
+		rows = append(rows, wrap([]span{grayed("· "), plain(n)}, width, nil, indent)...)
 	}
 	if text := strings.TrimSpace(b.text.String()); text != "" {
 		if len(rows) > 0 {
