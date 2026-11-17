@@ -1,0 +1,1 @@
+[Note from the program running this conversation, not from the user: your last reply {what}, so it was discarded and you are being asked again. Don't start that reply over. Think briefly, then take one concrete next step: call a tool, or give your answer.{extra}]

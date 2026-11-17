@@ -375,7 +375,7 @@ func (r *renderer) status(info StatusInfo, res agent.Result, elapsed time.Durati
 	}
 	output := r.deltas
 	if u := res.Usage; u != nil {
-		used := u.Input + u.Output
+		used := contextUsed(res)
 		if info.ContextWindow > 0 {
 			parts = append(parts, fmt.Sprintf("ctx %d%% (%s/%s)", used*100/info.ContextWindow, kTokens(used), kTokens(info.ContextWindow)))
 		} else {
@@ -391,6 +391,27 @@ func (r *renderer) status(info StatusInfo, res agent.Result, elapsed time.Durati
 		}
 	}
 	return append(parts, fmt.Sprintf("%.1fs", elapsed.Seconds()))
+}
+
+// contextUsed is the size of the conversation after a turn, in tokens: what
+// the next request sends, which leaves out reasoning the provider doesn't
+// take back. The status line shows it, and auto-compaction goes by it: a
+// reply that thought for long doesn't make the conversation any fuller. 0
+// when the server reported no usage.
+func contextUsed(res agent.Result) int {
+	if res.Context > 0 {
+		return res.Context
+	}
+	if u := res.Usage; u != nil {
+		return u.Input + u.Output
+	}
+	return 0
+}
+
+// replyAgainText tells the user that a reply came to nothing and the model
+// is asked again.
+func replyAgainText(why string, attempt, of int) string {
+	return fmt.Sprintf("%s; it was discarded and the model is asked again (%d of %d).", why, attempt, of)
 }
 
 // kTokens writes a token count briefly: 950, 8.1k, 262k.

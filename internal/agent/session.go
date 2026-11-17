@@ -27,10 +27,22 @@ const (
 	maxFailures     = 3   // invalid calls of one kind in a row
 	maxRepeats      = 3   // identical calls, or texts, in a row; one more stops the turn
 
-	// A turn that only reads for this many rounds of calls in a row is told
-	// to act or report; at stallStop it ends, and the user decides.
+	// A turn whose rounds of calls only repeat reads it already made, this
+	// many in a row, is told to act or report; at stallStop it ends, and the
+	// user decides. Reading something new isn't a stall: it may be the task.
 	stallNudge = 20
 	stallStop  = 30
+
+	// A reply that comes to nothing (it kept repeating itself, thought past
+	// thinkCeiling, or ended without an answer or a call) is thrown away and
+	// asked for again, with a note and little thinking. After this many in a
+	// row the turn stops.
+	replyRetries = 2
+	// thinkCeiling is the most reasoning one reply may hold, in characters:
+	// about 32,000 tokens, well over what a reply that went on to act was
+	// seen to think. Nothing else ends a thought that runs away on a server
+	// without an output limit, short of its context window.
+	thinkCeiling = 32_000 * charsPerToken
 )
 
 // Session is one conversation with a provider.
@@ -470,17 +482,26 @@ func (s *Session) Available(k tools.Kind) bool {
 
 // Result describes one turn.
 type Result struct {
-	Text       string // the last reply's text
-	Reasoning  string
-	Usage      *provider.Usage // of the last request; nil when the server reported none
+	Text      string // the last reply's text
+	Reasoning string
+	Usage     *provider.Usage // of the last request; nil when the server reported none
+	// Context is the size of the conversation, in tokens, as the next
+	// request sends it, by the last reply's count: less than Usage adds up
+	// to when the reply thought and the provider doesn't take reasoning
+	// back. 0 when the server reported none.
+	Context    int
 	StopReason provider.StopReason
 	StopDetail string // more about the stop, such as why a model refused
 	Steps      int    // requests sent
 	Stopped    string // why the agent ended the turn early, if it did
 }
 
-// errRepeating ends a reply that keeps repeating itself.
-var errRepeating = errors.New("the reply keeps repeating itself")
+// errRepeating ends a reply that keeps repeating itself, errOverthinking
+// one whose reasoning passed thinkCeiling.
+var (
+	errRepeating    = errors.New("the reply keeps repeating itself")
+	errOverthinking = errors.New("the reply's reasoning ran past the limit")
+)
 
 // Send runs one turn: it sends the user's message, shows the reply through
 // host, runs the tool calls the reply makes and sends back their results,
@@ -510,16 +531,21 @@ type turn struct {
 
 	lastCall    string // the previous call, as callKey
 	callRepeats int
-	lastText    string // the previous reply's text, when it made calls
+	lastText    string // the previous reply's text and calls, when it made calls
 	textRepeats int
 	failKind    string // the kind of the previous invalid calls
 	failures    int
 	notes       []string // loop warnings to send with the next tool results
-	stall       int      // rounds of calls in a row that only read
+	stall       int      // rounds of calls in a row that only repeated reads
 	acted       atomic.Bool
+	seen        map[string]bool // the calls made since the turn last changed something, by callKey
+	newGround   bool            // the round under way makes a call that isn't in seen
 
-	compactFailed bool // a compaction failed in this turn
-	compactWait   int  // rounds of calls before it may compact again
+	retries int  // replies in a row that came to nothing
+	easy    bool // the next request thinks little: the last reply came to nothing
+
+	compactFails int // compactions that failed in this turn
+	compactWait  int // rounds of calls before it may compact again
 }
 
 func (t *turn) run(ctx context.Context) (Result, error) {
@@ -534,27 +560,38 @@ func (t *turn) run(ctx context.Context) (Result, error) {
 		res.Steps = step
 		res.Text, res.Reasoning, res.StopReason, res.StopDetail = r.text, r.reasoning, r.stop, r.detail
 		if r.usage != nil {
-			res.Usage = r.usage
+			res.Usage, res.Context = r.usage, r.carried
 		}
 		if r.stop == provider.StopRefusal && err == nil {
 			// What a refused reply wrote isn't an answer, and none of its
 			// calls may run: it stays out of the conversation.
 			return res, nil
 		}
+		if w := wasted(r, err); w != nil {
+			if err := ctx.Err(); err != nil {
+				return res, err // the user's interruption came first
+			}
+			// It stays out of the conversation, where it would only lead the
+			// model the same way again, and the model is asked once more.
+			if t.retries == replyRetries {
+				res.Stopped = fmt.Sprintf("%s, %d times in a row", w.stopped, t.retries+1)
+				return res, nil
+			}
+			t.retries++
+			t.askAgain(w)
+			continue
+		}
+		t.retries, t.easy = 0, false
 		if err != nil {
 			r.calls = nil // calls without results would break the next request
 			t.add(r)
-			if errors.Is(err, errRepeating) {
-				res.Stopped = "the model kept repeating the same text"
-				return res, nil
-			}
 			return res, err
 		}
 		t.add(r)
 		if len(r.calls) == 0 {
 			return res, nil
 		}
-		stop := t.checkText(r.text)
+		stop := t.checkText(r.text, r.calls)
 		results, stop := t.runCalls(ctx, r.calls, stop)
 		if notes := t.s.takeInterjections(); len(notes) > 0 {
 			last := results.Parts[len(results.Parts)-1].ToolResult
@@ -578,7 +615,7 @@ func (t *turn) run(ctx context.Context) (Result, error) {
 			res.Stopped = stop
 			return res, nil
 		}
-		t.compactIfFull(ctx, r.usage)
+		t.compactIfFull(ctx, r)
 		if err := ctx.Err(); err != nil {
 			return res, err
 		}
@@ -591,11 +628,14 @@ type reply struct {
 	// parts is what it thought, said and called, in the order it did:
 	// providers such as Anthropic want their blocks back that way, thinking
 	// blocks unchanged (SPEC §4.4). A call's part points into calls.
-	parts  []provider.Part
-	calls  []provider.ToolCall // complete ones only
-	usage  *provider.Usage
-	stop   provider.StopReason
-	detail string
+	parts []provider.Part
+	calls []provider.ToolCall // complete ones only
+	usage *provider.Usage
+	// carried is what the conversation takes in the next request, in
+	// tokens, by usage (see carried); 0 without usage.
+	carried int
+	stop    provider.StopReason
+	detail  string
 }
 
 // add appends a reply to the turn's messages, if it says or does anything.
@@ -625,6 +665,9 @@ func (t *turn) reply(ctx context.Context) (reply, error) {
 	t.host.ReplyStart()
 	defer t.host.ReplyEnd()
 	p, req := s.request(t.msgs)
+	if t.easy && req.Effort != effort.Default {
+		req.Effort = effort.AtMost(req.Effort, effort.Low)
+	}
 	stream, err := provider.StreamRetry(ctx, p, req, func(r provider.Retrying) { t.host.Event(r) })
 	if err != nil {
 		return reply{}, err
@@ -679,6 +722,9 @@ func (t *turn) reply(ctx context.Context) (reply, error) {
 				r.parts = append(r.parts, provider.Part{Kind: provider.PartToolCall, ToolCall: &r.calls[j]})
 			}
 		}
+		if r.usage != nil {
+			r.carried = carried(p, r)
+		}
 	}
 	for {
 		ev, err := stream.Recv()
@@ -706,6 +752,10 @@ func (t *turn) reply(ctx context.Context) (reply, error) {
 			if chant.reasoning(e.Text) {
 				finish()
 				return r, errRepeating
+			}
+			if reasoning.Len() > thinkCeiling {
+				finish()
+				return r, errOverthinking
 			}
 		case provider.Note:
 			// Its thinking block comes next, with the note's text in it.
@@ -742,6 +792,115 @@ func (t *turn) reply(ctx context.Context) (reply, error) {
 	}
 }
 
+// carried is the size, in tokens, of the conversation as the next request
+// sends it, by the count a reply came with: what its request held and what
+// the reply added, less its reasoning when the provider doesn't take that
+// back. Counting the reasoning made one long thought look like a full
+// conversation, which was then compacted for nothing.
+func carried(p provider.Provider, r reply) int {
+	out := r.usage.Output
+	if !keepsReasoning(p) && r.reasoning != "" {
+		rest := len(r.text)
+		for _, c := range r.calls {
+			rest += len(c.Name) + len(c.Args)
+		}
+		out = int(int64(out) * int64(rest) / int64(rest+len(r.reasoning)))
+	}
+	return r.usage.Input + out
+}
+
+// keepsReasoning reports whether a reply's reasoning goes back to the
+// provider with later requests; one that doesn't say keeps it.
+func keepsReasoning(p provider.Provider) bool {
+	k, ok := p.(provider.ReasoningKeeper)
+	return !ok || k.KeepsReasoning()
+}
+
+// waste is a reply that came to nothing, in a way worth asking again.
+type waste struct {
+	what, extra string // for the note to the model (prompt.ReplyAgain)
+	shown       string // what the user is told
+	stopped     string // why the turn stops, if it keeps happening
+}
+
+// wasted says whether a reply came to nothing: it was cut for repeating
+// itself or for thinking without end, or it ended by itself without an
+// answer or a complete call, as a model does after a long thought, or when
+// the output limit falls in its thinking.
+func wasted(r reply, err error) *waste {
+	switch {
+	case errors.Is(err, errRepeating):
+		return &waste{
+			what:    "kept repeating the same text",
+			shown:   "The reply kept repeating itself",
+			stopped: "the model's reply kept repeating the same text",
+		}
+	case errors.Is(err, errOverthinking):
+		return &waste{
+			what:    fmt.Sprintf("thought for more than %d tokens without an answer or a tool call", thinkCeiling/charsPerToken),
+			shown:   "The reply thought for too long without acting",
+			stopped: "the model thought past what one reply may hold without answering",
+		}
+	case err != nil, r.text != "", len(r.calls) > 0:
+		return nil
+	case r.stop == provider.StopMaxTokens:
+		return &waste{
+			what:    "reached the output limit before it gave an answer or completed a tool call",
+			extra:   "If you were writing a large file, write it in smaller pieces.",
+			shown:   "The reply reached the output limit before it did anything",
+			stopped: "the reply reached the output token limit before an answer or a tool call",
+		}
+	case r.stop == provider.StopEnd, r.stop == provider.StopToolUse, r.stop == "":
+		return &waste{
+			what:    "ended without an answer or a tool call",
+			extra:   "If the task is finished, say so in a sentence or two.",
+			shown:   "The reply ended without an answer or a tool call",
+			stopped: "the model's reply ended without an answer or a tool call",
+		}
+	}
+	return nil
+}
+
+// RetryWatcher is a Host that shows a reply being asked for again.
+type RetryWatcher interface {
+	// ReplyAgain says the last reply came to nothing, why, and that the
+	// model is asked again: this is retry attempt of of.
+	ReplyAgain(why string, attempt, of int)
+}
+
+// askAgain tells the model its reply was thrown away, and why, and has the
+// next request think little: what made a thought run away or go in circles
+// does it again at the same effort.
+func (t *turn) askAgain(w *waste) {
+	t.easy = true
+	t.tell(prompt.ReplyAgain(w.what, w.extra))
+	if rw, ok := t.host.(RetryWatcher); ok {
+		rw.ReplyAgain(w.shown, t.retries, replyRetries)
+	}
+}
+
+// tell adds a note from the program to the end of the conversation, which
+// is a message of the user's or a round's results: with the last result, as
+// the loop warnings go, or else hidden after the user's text. The messages
+// the session holds aren't changed.
+func (t *turn) tell(note string) {
+	msgs := slices.Clone(t.msgs)
+	last := &msgs[len(msgs)-1]
+	last.Parts = slices.Clone(last.Parts)
+	told := false
+	for i := len(last.Parts) - 1; i >= 0 && !told; i-- {
+		if r := last.Parts[i].ToolResult; r != nil {
+			with := *r
+			with.Content += "\n\n" + note
+			last.Parts[i].ToolResult, told = &with, true
+		}
+	}
+	if !told {
+		last.Parts = append(last.Parts, provider.Part{Kind: provider.PartText, Text: "\n\n" + note, Hidden: true})
+	}
+	t.msgs = msgs
+}
+
 // assignIDs gives calls without an ID, or with one already in use, a new
 // one: results are matched to calls by ID.
 func (s *Session) assignIDs(calls []provider.ToolCall) {
@@ -753,12 +912,17 @@ func (s *Session) assignIDs(calls []provider.ToolCall) {
 	}
 }
 
-// checkText watches for a model that says the same thing before each round
-// of calls. It returns a reason to stop the turn on the fourth time.
-func (t *turn) checkText(text string) string {
+// checkText watches for a model that says the same thing before the same
+// round of calls, over and over. It returns a reason to stop the turn on
+// the fourth time. The same words before different calls are no loop: a
+// model of few words says "Let me check." before every file it reads.
+func (t *turn) checkText(text string, calls []provider.ToolCall) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
+	}
+	for _, c := range calls {
+		text += "\x00" + c.Name + "\x00" + string(c.Args)
 	}
 	if text == t.lastText {
 		t.textRepeats++
@@ -767,32 +931,42 @@ func (t *turn) checkText(text string) string {
 	}
 	switch {
 	case t.textRepeats > maxRepeats:
-		return fmt.Sprintf("the model wrote the same text %d times in a row", t.textRepeats)
+		return fmt.Sprintf("the model wrote the same text and made the same calls %d times in a row", t.textRepeats)
 	case t.textRepeats == maxRepeats:
-		t.notes = append(t.notes, fmt.Sprintf("[Note: you have written the same text %d times in a row. "+
+		t.notes = append(t.notes, fmt.Sprintf("[Note: you have written the same text and made the same calls %d times in a row. "+
 			"You may be stuck in a loop: step back and try a different approach. Repeating it once more stops this turn.]", maxRepeats))
 	}
 	return ""
 }
 
-// checkStall watches for a model that keeps reading without acting or
-// answering: it tells it to act or report, and if that changes nothing it
-// ends the turn, for the user to decide. It returns stop, or the reason.
+// checkStall watches for a model that goes in circles: round after round
+// of calls that only read, each one a call it already made since it last
+// changed something. It tells it to act or report, and if that changes
+// nothing it ends the turn, for the user to decide. A round that reads
+// something new starts the count over, as one that acts does: reading may
+// be the whole task, and a long one. It returns stop, or the reason.
 func (t *turn) checkStall(stop string) string {
+	fresh := t.newGround
+	t.newGround = false
 	if t.s.noStall {
 		return stop
 	}
 	if t.acted.Swap(false) {
+		t.stall = 0
+		clear(t.seen) // what it read may have changed
+		return stop
+	}
+	if fresh {
 		t.stall = 0
 		return stop
 	}
 	t.stall++
 	switch {
 	case t.stall >= stallStop && stop == "":
-		return fmt.Sprintf("%d rounds of tool calls that only read, without changing anything. Send \"continue\" to let it go on, or say what you want instead", t.stall)
+		return fmt.Sprintf("%d rounds of tool calls in a row that only repeated reads made before, without changing anything. Send \"continue\" to let it go on, or say what you want instead", t.stall)
 	case t.stall == stallNudge:
-		t.notes = append(t.notes, fmt.Sprintf("[Note: you have made %d rounds of tool calls that only read, without changing anything or telling the user what you found. "+
-			"You likely know enough: act on it, or end your turn by telling the user what you found and what you need from them. %d more rounds like this stop the turn.]", stallNudge, stallStop-stallNudge))
+		t.notes = append(t.notes, fmt.Sprintf("[Note: for %d rounds in a row your tool calls only repeated reads you had already made, without changing anything. "+
+			"You have what they return: act on it, or end your turn by telling the user what you found and what you need from them. %d more rounds like this stop the turn.]", stallNudge, stallStop-stallNudge))
 	}
 	return stop
 }
@@ -946,10 +1120,17 @@ func (t *turn) prepare(ctx context.Context, c provider.ToolCall) (p *prepared, c
 	t.failKind, t.failures = "", 0
 
 	// The same call over and over (SPEC §7).
-	if key := callKey(tool.Name(), args); key == t.lastCall {
+	key := callKey(tool.Name(), args)
+	if key == t.lastCall {
 		t.callRepeats++
 	} else {
 		t.lastCall, t.callRepeats = key, 1
+	}
+	if !t.seen[key] {
+		if t.seen == nil {
+			t.seen = map[string]bool{}
+		}
+		t.seen[key], t.newGround = true, true
 	}
 	if t.callRepeats > maxRepeats {
 		msg := fmt.Sprintf("Not run: this is call number %d to %s in a row with identical arguments.", t.callRepeats, tool.Name())

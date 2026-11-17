@@ -203,6 +203,15 @@ type PrefixCacher interface {
 	CachesPrefix() bool
 }
 
+// ReasoningKeeper is a provider that says whether a reply's reasoning goes
+// back to the model with the requests that follow in the same turn. One
+// that doesn't keep it carries less than the reply's token count says: the
+// agent sizes the conversation without it. A provider that doesn't say
+// keeps it.
+type ReasoningKeeper interface {
+	KeepsReasoning() bool
+}
+
 // Modeler is a provider that says which model it asks for; both adapters
 // do, and the session prices requests by it.
 type Modeler interface {

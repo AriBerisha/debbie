@@ -81,7 +81,7 @@ func (c *chat) loadSession(path string) ([]provider.Message, error) {
 	}
 	c.opts.Session.Resume(history, tainted)
 	c.opts.Sessions.Resume(path, history, tainted)
-	c.lastUsage, c.goal = contextEstimate(agent.EstimateTokens(history)), nil
+	c.lastUsage, c.goal = contextEstimate(c.opts.Session.Size()), nil
 	return history, nil
 }
 

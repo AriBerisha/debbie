@@ -27,7 +27,20 @@ const (
 	compactMargin    = 1_024  // room left for the estimate being off
 	charsPerToken    = 4      // the rough size of a token, for estimates
 	slimKeep         = 1_500  // characters kept at each end of a long tool result
-	compactRounds    = 3      // rounds of calls a turn lets pass after compacting
+	compactRounds    = 3      // rounds of calls a turn lets pass after compacting, or after failing to
+	compactTries     = 2      // failed compactions after which a turn stops trying
+
+	// A turn compacted while it runs keeps its latest rounds of calls word
+	// for word, beside the summary: as many as fit in a share of the size
+	// that set the compaction off, so the model goes on from what it just
+	// read instead of reading it again.
+	tailShare = 5      // one part in this many
+	tailMax   = 40_000 // tokens, at most
+
+	// thoughtKeep is how much of a reply's reasoning, from its end, the
+	// summarizer gets to read when the provider doesn't keep reasoning in
+	// the conversation: where a model that thinks reaches its conclusions.
+	thoughtKeep = 2_000
 )
 
 // ErrNothingToCompact is returned for a conversation too short to compact.
@@ -49,10 +62,26 @@ type CompactResult struct {
 // 1280 by 800 pixels is a thousand to two thousand tokens.
 const imageTokens = 1500
 
-func EstimateTokens(msgs []provider.Message) int {
+func EstimateTokens(msgs []provider.Message) int { return estimate(msgs, true) }
+
+// Size guesses the size of the conversation in tokens as the session's
+// provider gets it: without the reasoning, if it doesn't take that back.
+func (s *Session) Size() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return estimate(s.history, keepsReasoning(s.provider))
+}
+
+// estimate guesses the size of messages in tokens; reasoning says whether
+// the replies' reasoning counts, which a provider that doesn't take it
+// back never sees again.
+func estimate(msgs []provider.Message, reasoning bool) int {
 	chars := 0
 	for _, m := range msgs {
 		for _, p := range m.Parts {
+			if p.Kind == provider.PartReasoning && !reasoning {
+				continue
+			}
 			chars += len(p.Text)
 			if p.ToolCall != nil {
 				chars += len(p.ToolCall.Name) + len(p.ToolCall.Args)
@@ -107,14 +136,36 @@ func (s *Session) compactMessages(ctx context.Context, history []provider.Messag
 	if len(history) < 2 {
 		return nil, CompactResult{}, ErrNothingToCompact
 	}
-	before := EstimateTokens(history)
+	p, _ := s.request(nil)
+	// Reasoning the provider never gets back takes no room in the request:
+	// counted, it left a long conversation of a model that thinks a lot
+	// with next to no room for its summary.
+	keeps := keepsReasoning(p)
+	before := estimate(history, keeps)
+	over := func(msgs []provider.Message) bool {
+		return contextWindow > 0 && estimate(msgs, keeps)+compactMaxOutput+compactMargin > contextWindow
+	}
 	msgs := history
-	if contextWindow > 0 && before+compactMaxOutput+compactMargin > contextWindow {
+	if !cachesPrefix(p) {
+		// What the model concluded is in its reasoning, which the summarizer
+		// may not see: a provider that doesn't keep reasoning never sends it,
+		// and one that does may send only the current turn's, which the
+		// request for the summary ends. Without it the summarizer would have
+		// to work everything out again from the tool results, in one pass.
+		msgs = withThoughts(history)
+	}
+	if keeps && over(msgs) {
+		msgs = history // the reasoning itself may go along, so the excerpts go first
+	}
+	if over(msgs) {
 		msgs = slim(msgs)
+	}
+	if over(msgs) {
+		msgs = slim(history)
 	}
 	maxOut := compactMaxOutput
 	if contextWindow > 0 {
-		used := EstimateTokens(msgs) + s.compactOverhead(focus)/charsPerToken
+		used := estimate(msgs, keeps) + s.compactOverhead(focus)/charsPerToken
 		maxOut = max(1, min(compactMaxOutput, contextWindow-used-compactMargin))
 	}
 	summary, stop, err := s.summarize(ctx, msgs, prompt.CompressionRequest(focus), maxOut, false, progress)
@@ -143,6 +194,43 @@ func (s *Session) compactMessages(ctx context.Context, history []provider.Messag
 		return nil, CompactResult{Before: before, After: before, Messages: len(history)}, ErrNotSmaller
 	}
 	return compacted, CompactResult{Before: before, After: EstimateTokens(compacted), Messages: len(history)}, nil
+}
+
+// withThoughts returns msgs with the end of each reply's reasoning as text
+// at the start of the reply, for the summarizer to read whatever the
+// provider does with the reasoning itself, which stays. A reply without
+// reasoning stays as it is, and so does reasoning that is a provider's own
+// block.
+func withThoughts(msgs []provider.Message) []provider.Message {
+	out := make([]provider.Message, len(msgs))
+	for i, m := range msgs {
+		out[i] = m
+		if text := thoughtEnd(m); text != "" {
+			excerpt := provider.Part{Kind: provider.PartText, Text: prompt.CompressionThought(text) + "\n\n"}
+			out[i].Parts = append([]provider.Part{excerpt}, m.Parts...)
+		}
+	}
+	return out
+}
+
+// thoughtEnd is the end of a reply's reasoning, where a model that thinks
+// reaches its conclusions: its last thoughtKeep characters, "" when the
+// message has none that is plain text.
+func thoughtEnd(m provider.Message) string {
+	if m.Role != provider.RoleAssistant {
+		return ""
+	}
+	var thought strings.Builder
+	for _, p := range m.Parts {
+		if p.Kind == provider.PartReasoning && p.Opaque == nil {
+			thought.WriteString(p.Text)
+		}
+	}
+	text := strings.TrimSpace(thought.String())
+	if len(text) > thoughtKeep {
+		text = "… " + text[runeStart(text, len(text)-thoughtKeep):]
+	}
+	return text
 }
 
 // compactOverhead is the size, in characters, of what a summary request
@@ -185,21 +273,23 @@ func (s *Session) SetAutoCompact(at, contextWindow int) {
 // next request would come near the limit: a long turn would otherwise run
 // out of context before it ends.
 //
-// The summary covers what came before the last round of calls. That round,
-// which the model hasn't seen the results of, goes with the message that
-// tells it to carry on, word for word: the results themselves, and what came
-// with them, such as a message from the user or an agent's report. That way
-// nothing it is about to act on depends on a summary.
+// The summary covers the whole conversation. The turn's latest rounds of
+// calls go with the message that tells the model to carry on, word for
+// word (see recentRounds): the last one, which it hasn't seen the results
+// of, with what came along, such as a message from the user or an agent's
+// report, and as many before it as fit. That way nothing it is about to
+// act on depends on a summary, and it doesn't start by reading again what
+// it had just read.
 //
-// A failure leaves the conversation as it is, and isn't tried again in this
-// turn: the next request may still fit.
-func (t *turn) compactIfFull(ctx context.Context, u *provider.Usage) {
+// A failure leaves the conversation as it is: the next request may still
+// fit. It is tried once more, some rounds later.
+func (t *turn) compactIfFull(ctx context.Context, r reply) {
 	s := t.s
 	s.mu.Lock()
-	at, window := s.compactAt, s.compactWindow
+	at, window, p := s.compactAt, s.compactWindow, s.provider
 	s.mu.Unlock()
 	n := len(t.msgs)
-	if at <= 0 || t.compactFailed || n < 4 {
+	if at <= 0 || t.compactFails >= compactTries || n < 4 {
 		return
 	}
 	// A limit so low that the system prompt and a round or two reach it
@@ -208,10 +298,11 @@ func (t *turn) compactIfFull(ctx context.Context, u *provider.Usage) {
 		t.compactWait--
 		return
 	}
-	used := EstimateTokens(t.msgs)
-	if u != nil {
-		// The last reply's real count, and the results it didn't include.
-		used = u.Input + u.Output + EstimateTokens(t.msgs[n-1:])
+	used := estimate(t.msgs, keepsReasoning(p))
+	if r.usage != nil {
+		// What the last reply's real count carries on, and the results it
+		// didn't include.
+		used = r.carried + EstimateTokens(t.msgs[n-1:])
 	}
 	if used < at {
 		return
@@ -220,23 +311,74 @@ func (t *turn) compactIfFull(ctx context.Context, u *provider.Usage) {
 	if w != nil {
 		w.CompactStart()
 	}
-	compacted, res, err := s.compactMessages(ctx, t.msgs[:n-2], "", window, nil)
+	compacted, res, err := s.compactMessages(ctx, t.msgs, "", window, nil)
 	if err != nil {
-		t.compactFailed = true
+		t.compactFails++
+		t.compactWait = compactRounds
 		if w != nil {
 			w.Compacted(res, err)
 		}
 		return
 	}
 	s.afterCompact()
-	carryOn := s.userMessage(prompt.CompressionContinue(lastRound(t.msgs[n-2], t.msgs[n-1])))
+	tail := t.msgs[recentRounds(t.msgs, min(at/tailShare, tailMax)):]
+	carryOn := s.userMessage(prompt.CompressionContinue(rounds(tail)))
 	carryOn.Parts[0].Hidden = true // the user wrote none of it
 	t.msgs = append(compacted, carryOn)
 	t.compactWait = compactRounds
+	// What it read went with the conversation: reading it again is no stall.
+	t.stall = 0
+	clear(t.seen)
 	s.setHistory(t.msgs, true)
+	res.After = EstimateTokens(t.msgs)
 	if w != nil {
 		w.Compacted(res, nil)
 	}
+}
+
+// recentRounds returns where the latest rounds of calls start in msgs, the
+// conversation of a turn that just got a round's results: as many whole
+// rounds, a reply with calls and the results of them, as take at most
+// budget tokens written out, and the last one whatever it takes.
+func recentRounds(msgs []provider.Message, budget int) int {
+	from, size := len(msgs)-2, 0
+	for i := len(msgs) - 2; i >= 1 && isRound(msgs[i], msgs[i+1]); i -= 2 {
+		size += estimate(msgs[i:i+2], false)
+		if size > budget && i < len(msgs)-2 {
+			break
+		}
+		from = i
+	}
+	return from
+}
+
+// isRound reports whether two messages are a reply that made calls and the
+// results of them.
+func isRound(reply, results provider.Message) bool {
+	if reply.Role != provider.RoleAssistant || results.Role != provider.RoleUser {
+		return false
+	}
+	called, answered := false, false
+	for _, p := range reply.Parts {
+		called = called || p.ToolCall != nil
+	}
+	for _, p := range results.Parts {
+		answered = answered || p.ToolResult != nil
+	}
+	return called && answered
+}
+
+// rounds writes out rounds of calls, each a reply and its results, as text.
+func rounds(msgs []provider.Message) string {
+	var b strings.Builder
+	n := len(msgs) / 2
+	for i := 0; i+1 < len(msgs); i += 2 {
+		if n > 1 {
+			fmt.Fprintf(&b, "Round %d of %d:\n", i/2+1, n)
+		}
+		b.WriteString(lastRound(msgs[i], msgs[i+1]) + "\n\n")
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // lastRound writes out a reply and the results of its calls as text.
@@ -248,6 +390,11 @@ func lastRound(reply, results provider.Message) string {
 		}
 	}
 	var b strings.Builder
+	// What it concluded before it made the calls: a model that reads its
+	// earlier reasoning would otherwise go on without it.
+	if thought := thoughtEnd(reply); thought != "" {
+		b.WriteString("Your reasoning ended:\n" + thought + "\n\n")
+	}
 	if text := strings.TrimSpace(reply.Text()); text != "" {
 		b.WriteString("You wrote:\n" + text + "\n\n")
 	}

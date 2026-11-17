@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"debbie/internal/agent"
 	"debbie/internal/config"
@@ -191,6 +192,18 @@ func (m *Manager) Test(ctx context.Context, p Prompter, name string) error {
 		}
 	default:
 		p.Say("  ✓ tool calling works")
+	}
+	if a, ok := conn.Adapter.(*provider.OpenAI); ok && prov.Adapter == config.AdapterOpenAI {
+		// The checks loaded the model, so a router can speak for it now.
+		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		a.ServerInfo(sctx)
+		cancel()
+		mark := "–"
+		sent, why := a.ReasoningBack()
+		if sent {
+			mark = "✓"
+		}
+		p.Say("  " + mark + " " + why)
 	}
 	return nil
 }

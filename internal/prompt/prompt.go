@@ -142,6 +142,19 @@ var ultraWorkflowOffText string
 // UltraWorkflowOff says the push is over.
 func UltraWorkflowOff() string { return strings.TrimSpace(ultraWorkflowOffText) }
 
+//go:embed reply_again.md
+var replyAgainText string
+
+// ReplyAgain tells the model that its last reply came to nothing and was
+// thrown away: what it did, as "your last reply {what}", and, if not empty,
+// a sentence more on what to do instead.
+func ReplyAgain(what, extra string) string {
+	if extra != "" {
+		extra = " " + extra
+	}
+	return strings.NewReplacer("{what}", what, "{extra}", extra).Replace(strings.TrimSpace(replyAgainText))
+}
+
 // The compaction prompts, ported from Qwen Code's compression service
 // (SPEC §7): the summarizer's system prompt, the request that ends the
 // conversation sent to it, the header and trailer around the summary that
@@ -207,9 +220,21 @@ func CompressionInline() string {
 var compressionContinueText string
 
 // CompressionContinue carries on a turn that was compacted while it ran,
-// with its last round of calls, which the summary doesn't cover.
-func CompressionContinue(round string) string {
-	return strings.TrimSpace(compressionContinueText) + "\n\n" + round
+// with its latest rounds of calls written out, which the summary covers
+// only in brief.
+func CompressionContinue(rounds string) string {
+	return strings.TrimSpace(compressionContinueText) + "\n\n" + rounds
+}
+
+//go:embed compression_thought.md
+var compressionThoughtText string
+
+// CompressionThought marks the end of a reply's reasoning for the
+// summarizer, which reads it at the start of that reply: a provider that
+// doesn't keep reasoning in the conversation would otherwise lose what the
+// model concluded there.
+func CompressionThought(thought string) string {
+	return strings.ReplaceAll(strings.TrimSpace(compressionThoughtText), "{thought}", thought)
 }
 
 // CompressionRetry asks again for a summary that didn't come, without the

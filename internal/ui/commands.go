@@ -6,6 +6,7 @@ import (
 
 	"debbie/internal/effort"
 	"debbie/internal/setup"
+	"debbie/internal/skills"
 )
 
 // The slash commands: one table, for /help and the completion, and one
@@ -56,6 +57,14 @@ var commandList = []command{
 	{name: "/quit", about: "leave (or ctrl+c twice, or ctrl+d)"},
 	{name: "/resume", args: "[text | rename <name>]", about: "go back to an earlier conversation in this folder, or name this one",
 		subs: []subcommand{{"rename", "name this conversation, for /resume", true}}},
+	{name: "/skill", args: "[enable|disable|info] <name>", about: "list skills, enable or disable one, or show its details; /skill alone lists them",
+		subs: func() []subcommand {
+			subs := []subcommand{{"enable", "enable a skill for the session", true}, {"disable", "disable a skill", true}, {"info", "show details about a skill", true}}
+			for _, s := range skills.List() {
+				subs = append(subs, subcommand{s.ID, s.Summary, false})
+			}
+			return subs
+		}()},
 	{name: "/web", args: "[off|safe|yolo|browser [install]]", about: "web access: the browser tools and whether they ask, and Chrome's connection",
 		subs: []subcommand{{"safe", "the browser tools ask before opening a site", false}, {"off", "no web tools", false},
 			{"yolo", "the browser tools run without asking", false}, {"browser", "whether Chrome is connected", false},
@@ -82,6 +91,7 @@ type commandUI interface {
 	resume(arg string)
 	rename(arg string)
 	cost(arg string)
+	skill(arg string)
 	web(arg string)
 	browserInstall()
 	provider(arg string)
@@ -148,6 +158,8 @@ func runCommand(u commandUI, cmd string) {
 		u.resume(arg)
 	case "/cost":
 		u.cost(arg)
+	case "/skill", "/skills":
+		u.skill(arg)
 	case "/web":
 		if rest, ok := subArgument(arg, "browser"); ok {
 			switch rest {
@@ -266,6 +278,112 @@ func workersText(m *setup.Manager) string {
 	return "Agents run on " + on + ", at " + level + ". " + workersUsage
 }
 
+// skillCommand runs /skill for both UIs. It returns what to tell the user
+// and false for a bad argument.
+func skillCommand(opts *ChatOptions, arg string) (string, bool) {
+	if opts.Skills == nil {
+		return "Skills are not available in this session.", false
+	}
+	fields := strings.Fields(arg)
+	if len(builtinSkills()) == 0 { // the public build, for now (skills.go)
+		return noSkills, len(fields) == 0
+	}
+	if len(fields) == 0 {
+		return skillList(opts.Skills), true
+	}
+	sub, rest := fields[0], ""
+	if len(fields) > 1 {
+		rest = fields[1]
+	}
+	switch sub {
+	case "enable":
+		if rest == "" {
+			return "/skill enable <name>: " + strings.Join(skills.IDs(), ", "), false
+		}
+		if err := opts.Skills.Enable(rest); err != nil {
+			return err.Error(), false
+		}
+		if opts.UpdateSystem != nil {
+			opts.UpdateSystem()
+		}
+		sk := skills.Lookup(rest)
+		return sk.Name + " enabled for this session.", true
+	case "disable":
+		if rest == "" {
+			return "/skill disable <name>: " + strings.Join(skills.IDs(), ", "), false
+		}
+		if err := opts.Skills.Disable(rest); err != nil {
+			return err.Error(), false
+		}
+		if opts.UpdateSystem != nil {
+			opts.UpdateSystem()
+		}
+		sk := skills.Lookup(rest)
+		return sk.Name + " disabled.", true
+	case "info":
+		if rest == "" {
+			return "/skill info <name>: " + strings.Join(skills.IDs(), ", "), false
+		}
+		sk := skills.Lookup(rest)
+		if sk == nil {
+			return fmt.Sprintf("Unknown skill %q; /skill lists them.", rest), false
+		}
+		status := "disabled"
+		if opts.Skills.IsEnabled(sk.ID) {
+			status = "enabled"
+		}
+		return fmt.Sprintf("%s (%s)\n%s\n\nStatus: %s", sk.Name, sk.ID, sk.Description, status), true
+	default:
+		// Treat bare name as a toggle or info shortcut.
+		sk := skills.Lookup(sub)
+		if sk != nil {
+			if opts.Skills.IsEnabled(sk.ID) {
+				opts.Skills.Disable(sk.ID)
+				if opts.UpdateSystem != nil {
+					opts.UpdateSystem()
+				}
+				return sk.Name + " disabled.", true
+			}
+			opts.Skills.Enable(sk.ID)
+			if opts.UpdateSystem != nil {
+				opts.UpdateSystem()
+			}
+			return sk.Name + " enabled for this session.", true
+		}
+		return fmt.Sprintf("Unknown skill subcommand %q. Use /skill, /skill enable <name>, /skill disable <name>, or /skill info <name>.", sub), false
+	}
+}
+
+// builtinSkills lists the skills the build has; tests replace it.
+var builtinSkills = skills.List
+
+const noSkills = "This build of debbie has no skills to turn on."
+
+// skillList formats the skill list for /skill.
+func skillList(set *skills.Set) string {
+	all := skills.List()
+	var lines []string
+	lines = append(lines, "Skills (/skill enable <name> to turn one on, /skill info <name> for details):")
+	nameW := 0
+	for _, s := range all {
+		if len(s.ID) > nameW {
+			nameW = len(s.ID)
+		}
+	}
+	for _, s := range all {
+		status := " "
+		if set.IsEnabled(s.ID) {
+			status = "*"
+		}
+		lines = append(lines, fmt.Sprintf("  %s %-*s  %s", status, nameW, s.ID, s.Summary))
+	}
+	n := set.Count()
+	if n > 0 {
+		lines = append(lines, fmt.Sprintf("\n%d skill%s enabled (* above); their prompts are in the system context.", n, pluralS(n)))
+	}
+	return strings.Join(lines, "\n")
+}
+
 // lineCommands runs the commands in line mode.
 type lineCommands struct {
 	c        *chat
@@ -314,6 +432,14 @@ func (l *lineCommands) model(arg string)  { l.c.modelCommand(arg) }
 func (l *lineCommands) resume(arg string) { l.c.resumeCommand(arg) }
 func (l *lineCommands) rename(arg string) { l.c.renameCommand(arg) }
 func (l *lineCommands) cost(arg string)   { l.c.costCommand(arg) }
+func (l *lineCommands) skill(arg string) {
+	msg, ok := skillCommand(&l.c.opts, arg)
+	if ok {
+		l.say(msg)
+	} else {
+		l.warn(msg)
+	}
+}
 func (l *lineCommands) web(arg string) {
 	c := l.c
 	msg, ok, yolo := webCommand(&c.opts, arg)
@@ -377,6 +503,14 @@ func (s screenCommands) model(arg string)  { s.f.modelCommand(arg) }
 func (s screenCommands) resume(arg string) { s.f.resumeCommand(arg) }
 func (s screenCommands) rename(arg string) { s.f.renameCommand(arg) }
 func (s screenCommands) cost(arg string)   { s.f.costCommand(arg) }
+func (s screenCommands) skill(arg string) {
+	msg, ok := skillCommand(&s.f.opts, arg)
+	if ok {
+		s.say(msg)
+	} else {
+		s.warn(msg)
+	}
+}
 func (s screenCommands) web(arg string) {
 	f := s.f
 	msg, ok, yolo := webCommand(&f.opts, arg)

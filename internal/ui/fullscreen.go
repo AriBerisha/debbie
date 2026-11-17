@@ -1407,9 +1407,9 @@ func (f *fullscreen) finish(res agent.Result, err error) {
 	}
 	f.lastUsage = append(f.usage(res), f.costPart()...)
 	next := func() { f.goalStep(err, res.Stopped) }
-	if u := res.Usage; u != nil && err == nil {
-		if at := f.autoCompactAt(); at > 0 && u.Input+u.Output >= at {
-			f.say(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/compact auto).", kTokens(u.Input+u.Output)), inkGray)
+	if used := contextUsed(res); used > 0 && err == nil {
+		if at := f.autoCompactAt(); at > 0 && used >= at {
+			f.say(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/compact auto).", kTokens(used)), inkGray)
 			f.compact("", next)
 			return
 		}
@@ -1441,6 +1441,11 @@ func (f *fullscreen) BackgroundDone(description string) {
 		f.say("Agent finished: "+description, inkGray)
 		f.sendQueued()
 	})
+}
+
+// ReplyAgain shows that a reply came to nothing and is asked for again.
+func (f *fullscreen) ReplyAgain(why string, attempt, of int) {
+	f.post(func() { f.say(replyAgainText(why, attempt, of), inkGray) })
 }
 
 // CompactStart shows that a compaction started while a turn runs.
@@ -1562,7 +1567,7 @@ func (f *fullscreen) usage(res agent.Result) []string {
 	var parts []string
 	output := f.deltas
 	if u := res.Usage; u != nil {
-		used := u.Input + u.Output
+		used := contextUsed(res)
 		if w := f.opts.Status.ContextWindow; w > 0 {
 			parts = append(parts, fmt.Sprintf("ctx %d%% (%s/%s)", used*100/w, kTokens(used), kTokens(w)))
 		} else {
@@ -1577,8 +1582,8 @@ func (f *fullscreen) usage(res agent.Result) []string {
 			parts = append(parts, fmt.Sprintf("%.1f tok/s", float64(output)/gen))
 		}
 	}
-	if u := res.Usage; u != nil {
-		if at := f.autoCompactAt(); at > 0 && u.Input+u.Output >= at*3/4 && u.Input+u.Output < at {
+	if used := contextUsed(res); used > 0 {
+		if at := f.autoCompactAt(); at > 0 && used >= at*3/4 && used < at {
 			parts = append(parts, fmt.Sprintf("compacts at %s", kTokens(at)))
 		}
 	}

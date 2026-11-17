@@ -18,6 +18,7 @@ import (
 	"debbie/internal/provider"
 	"debbie/internal/sessions"
 	"debbie/internal/setup"
+	"debbie/internal/skills"
 	"debbie/internal/tools"
 )
 
@@ -92,6 +93,11 @@ type ChatOptions struct {
 	// Prices price what the session spends (/cost); nil shows no cost.
 	Prices *cost.Table
 	Resume string
+	// Skills holds the built-in skill prompts that enhance the agent in
+	// specific domains (/skill). UpdateSystem, when set, rebuilds the
+	// system prompt after a skill is enabled or disabled.
+	Skills       *skills.Set
+	UpdateSystem func()
 }
 
 // Chat runs the conversation until the input ends, the user quits, or
@@ -600,9 +606,9 @@ func (c *chat) turn(text string) (quit bool) {
 	if !c.boxed() { // the box's footer shows it otherwise
 		c.r.println(c.statusLine(parts))
 	}
-	if u := res.Usage; u != nil && err == nil {
-		if at := agent.AutoCompactAt(c.opts.AutoCompact, c.opts.Status.ContextWindow); at > 0 && u.Input+u.Output >= at {
-			c.r.println(c.st.gray(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/compact auto).", kTokens(u.Input+u.Output))))
+	if used := contextUsed(res); used > 0 && err == nil {
+		if at := agent.AutoCompactAt(c.opts.AutoCompact, c.opts.Status.ContextWindow); at > 0 && used >= at {
+			c.r.println(c.st.gray(fmt.Sprintf("The conversation reached %s tokens of context; compacting it to make room (/compact auto).", kTokens(used))))
 			c.compactCommand("")
 		}
 	}
@@ -646,6 +652,12 @@ func (c *chat) Compacted(res agent.CompactResult, err error) {
 		return
 	}
 	c.r.printAbove(c.st.gray(fmt.Sprintf("Conversation compacted · %d messages, about %s → %s tokens", res.Messages, kTokens(res.Before), kTokens(res.After))))
+}
+
+// ReplyAgain shows that a reply came to nothing and is asked for again. It
+// comes between two replies, after the first one's ReplyEnd.
+func (c *chat) ReplyAgain(why string, attempt, of int) {
+	c.r.println(c.st.gray(replyAgainText(why, attempt, of)))
 }
 
 // The agent.Host methods.

@@ -43,6 +43,7 @@ type OpenAI struct {
 
 	mu           sync.Mutex     // guards what the server said, which a request may learn
 	effortLevels []effort.Level // what the chat template supports; nil when unknown
+	preserves    bool           // the server says the chat template keeps reasoning from the whole conversation
 	router       bool           // llama-server's router mode: each model says for itself
 	askedLevels  bool           // the router was asked about the model in use
 	noSummary    bool           // the Responses API refused reasoning summaries
@@ -75,14 +76,81 @@ func NewOpenAI(name string, p *config.Provider, apiKey string) (*OpenAI, error) 
 // Model returns the model that requests ask for.
 func (o *OpenAI) Model() string { return o.model }
 
+// KeepsReasoning says whether a reply's reasoning goes back with the turn's
+// later requests: the Responses API's reasoning items do, Chat Completions'
+// reasoning as reasoningMode says.
+func (o *OpenAI) KeepsReasoning() bool { return o.responses || o.reasoningMode() != reasoningNone }
+
+// reasoningMode is which replies' reasoning a Chat Completions request
+// sends back to the model.
+type reasoningMode int
+
+const (
+	reasoningNone reasoningMode = iota
+	// reasoningTurn sends that of the current turn: the steps after the last
+	// message the user typed, which older chat templates render.
+	reasoningTurn
+	// reasoningAll sends that of the whole conversation, for a chat template
+	// that keeps it: the model is trained to read what it thought before,
+	// and without it works every step out again from the tool results.
+	reasoningAll
+)
+
+// reasoningMode applies options.send_reasoning. Left out, the server
+// decides: llama-server tests each chat template and says in /props whether
+// it keeps reasoning from the whole conversation (supports_preserve_reasoning;
+// Qwen3.8's does, "for the best out-of-the-box experience", says its model
+// card). false sends none whatever the server says; true sends the current
+// turn's when the server doesn't say.
+func (o *OpenAI) reasoningMode() reasoningMode {
+	o.mu.Lock()
+	preserves := o.preserves
+	o.mu.Unlock()
+	switch set := o.opts.SendReasoning; {
+	case set != nil && !*set:
+		return reasoningNone
+	case preserves:
+		return reasoningAll
+	case set != nil:
+		return reasoningTurn
+	}
+	return reasoningNone
+}
+
+// ReasoningBack says, for the user, whether the model gets its earlier
+// reasoning back, and why.
+func (o *OpenAI) ReasoningBack() (sent bool, why string) {
+	o.mu.Lock()
+	preserves := o.preserves
+	o.mu.Unlock()
+	switch mode := o.reasoningMode(); {
+	case o.responses:
+		return true, "the Responses API keeps the model's reasoning"
+	case mode == reasoningAll:
+		return true, "the chat template keeps the model's earlier reasoning, so it is sent back (options.send_reasoning false turns that off)"
+	case mode == reasoningTurn:
+		return true, "the model's reasoning is sent back for the current turn (options.send_reasoning)"
+	case preserves:
+		return false, "the chat template keeps the model's earlier reasoning, but options.send_reasoning is false: it isn't sent back"
+	}
+	return false, "the server doesn't say its chat template keeps earlier reasoning, so it isn't sent back (options.send_reasoning true sends it)"
+}
+
+// learned records what a server said about the model in use.
+func (o *OpenAI) learned(info ServerInfo) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.preserves = info.PreservesReasoning
+}
+
 // SetModel changes the model that requests ask for. A router's models each
-// have their own levels, so they are asked about again.
+// have their own levels and chat template, so they are asked about again.
 func (o *OpenAI) SetModel(model string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.model = model
 	if o.router {
-		o.effortLevels, o.askedLevels = nil, false
+		o.effortLevels, o.askedLevels, o.preserves = nil, false, false
 	}
 }
 
@@ -117,6 +185,7 @@ func (o *OpenAI) learnLevels(ctx context.Context) {
 	switch {
 	case err == nil:
 		o.SetEffortLevels(info.EffortLevels)
+		o.learned(info)
 	case ctx.Err() != nil:
 		o.mu.Lock()
 		o.askedLevels = false // interrupted: the next request asks again
@@ -272,10 +341,11 @@ type llamaTimings struct {
 }
 
 // chatMessages converts the conversation to Chat Completions messages.
-// Reasoning is sent back only when sendReasoning is set, and then only for
-// the steps after the last message the user typed: the current turn's tool
-// calls, which chat templates such as Qwen's render with their reasoning.
-func chatMessages(system string, msgs []Message, sendReasoning bool) []chatMessage {
+// Which replies go back with their reasoning is reasoning's to say: none,
+// those of the steps after the last message the user typed (the current
+// turn's tool calls, which older chat templates such as Qwen3's render
+// with their reasoning), or all of them.
+func chatMessages(system string, msgs []Message, reasoning reasoningMode) []chatMessage {
 	out := make([]chatMessage, 0, len(msgs)+1)
 	if system != "" {
 		out = append(out, chatMessage{Role: "system", Content: system})
@@ -300,7 +370,7 @@ func chatMessages(system string, msgs []Message, sendReasoning bool) []chatMessa
 						tc.Function.Arguments = "{}"
 					}
 					cm.ToolCalls = append(cm.ToolCalls, tc)
-				case p.Kind == PartReasoning && sendReasoning && i > lastUser:
+				case p.Kind == PartReasoning && (reasoning == reasoningAll || reasoning == reasoningTurn && i > lastUser):
 					cm.ReasoningContent += p.Text
 				}
 			}
@@ -362,7 +432,7 @@ func chatTools(specs []ToolSpec) []chatTool {
 func (o *OpenAI) requestBody(req Request) ([]byte, error) {
 	body := chatRequest{
 		Model:              o.model,
-		Messages:           chatMessages(req.System, req.Messages, o.opts.SendReasoning),
+		Messages:           chatMessages(req.System, req.Messages, o.reasoningMode()),
 		Tools:              chatTools(req.Tools),
 		Stream:             true,
 		MaxTokens:          req.MaxTokens,
@@ -503,6 +573,11 @@ type ServerInfo struct {
 	// EffortLevels are the reasoning-effort levels the chat template renders
 	// distinctly, weakest first; nil when it has none.
 	EffortLevels []effort.Level
+	// PreservesReasoning says the chat template keeps the reasoning of
+	// earlier replies when it is sent back: llama-server renders a test
+	// conversation to find out (supports_preserve_reasoning, common/jinja/
+	// caps.cpp).
+	PreservesReasoning bool
 }
 
 // ServerInfo reads llama-server's GET /props, at the root of the server
@@ -515,6 +590,9 @@ type ServerInfo struct {
 func (o *OpenAI) ServerInfo(ctx context.Context) (ServerInfo, error) {
 	info, role, err := o.props(ctx, "/props")
 	if err != nil || role != "router" {
+		if err == nil {
+			o.learned(info)
+		}
 		return info, err
 	}
 	o.mu.Lock()
@@ -531,6 +609,7 @@ func (o *OpenAI) ServerInfo(ctx context.Context) (ServerInfo, error) {
 	o.mu.Lock()
 	o.askedLevels = true
 	o.mu.Unlock()
+	o.learned(own)
 	return own, nil
 }
 
@@ -589,15 +668,17 @@ func (o *OpenAI) props(ctx context.Context, path string) (ServerInfo, string, er
 			NCtx int `json:"n_ctx"`
 		} `json:"default_generation_settings"`
 		ChatTemplateCaps struct {
-			ReasoningEffortLevels []effort.Level `json:"reasoning_effort_levels"`
+			ReasoningEffortLevels     []effort.Level `json:"reasoning_effort_levels"`
+			SupportsPreserveReasoning bool           `json:"supports_preserve_reasoning"`
 		} `json:"chat_template_caps"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxEventSize)).Decode(&body); err != nil {
 		return ServerInfo{}, "", fmt.Errorf("%s sent malformed /props: %v", o.name, err)
 	}
 	return ServerInfo{
-		ContextWindow: body.DefaultGenerationSettings.NCtx,
-		EffortLevels:  body.ChatTemplateCaps.ReasoningEffortLevels,
+		ContextWindow:      body.DefaultGenerationSettings.NCtx,
+		EffortLevels:       body.ChatTemplateCaps.ReasoningEffortLevels,
+		PreservesReasoning: body.ChatTemplateCaps.SupportsPreserveReasoning,
 	}, body.Role, nil
 }
 

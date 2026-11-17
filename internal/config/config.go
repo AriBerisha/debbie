@@ -165,10 +165,14 @@ type ProviderOptions struct {
 	// parameters, such as top_k or reasoning_format. Fields the adapter sets
 	// itself can't be overridden.
 	ExtraBody map[string]json.RawMessage `json:"extra_body,omitempty"`
-	// SendReasoning sends the model's reasoning back with the tool-call
-	// steps of the current turn, for chat templates that keep it, such as
-	// Qwen's (SPEC §4.3). Off by default.
-	SendReasoning bool `json:"send_reasoning,omitempty"`
+	// SendReasoning says whether the model's reasoning goes back to it with
+	// the conversation (SPEC §4.1). Left out, the server decides: a
+	// llama-server whose chat template keeps earlier reasoning gets all of
+	// it, as newer models such as Qwen3.8 are trained to, and any other
+	// server none. false never sends it. true sends it even when the server
+	// doesn't say so, then for the tool-call steps of the current turn only,
+	// which is what older templates render.
+	SendReasoning *bool `json:"send_reasoning,omitempty"`
 	// WorkspaceID is the Claude Console workspace that requests run in, for
 	// an API key that isn't scoped to one; it goes in the
 	// anthropic-workspace-id header (SPEC §4.4).

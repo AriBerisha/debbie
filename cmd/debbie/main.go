@@ -30,6 +30,7 @@ import (
 	"debbie/internal/provider"
 	"debbie/internal/sessions"
 	"debbie/internal/setup"
+	"debbie/internal/skills"
 	"debbie/internal/tools"
 	"debbie/internal/ui"
 )
@@ -339,6 +340,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// access is the session's web access, set up below.
 	var access *browser.Access
 
+	// Skills: the built-in skill prompts the user can enable for the
+	// session (/skill). When one is enabled or disabled, the system
+	// prompt is rebuilt with the skills text appended.
+	skillSet := skills.NewSet()
+
+	// systemExtra builds the extra text appended to the system prompt:
+	// the provider's system_prompt_append and the enabled skills.
+	systemExtra := func(providerAppend string) string {
+		extra := providerAppend
+		if text := skillSet.Text(); text != "" {
+			if extra != "" {
+				extra += "\n\n"
+			}
+			extra += text
+		}
+		return extra
+	}
+
 	// use switches the session to another configured provider.
 	use := func(ctx context.Context, name string) (*setup.Conn, error) {
 		p := cfg.Providers[name]
@@ -353,7 +372,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		c.AutoCompact = manager.AutoCompactFor(name)
 		followConfig()
 		session.SetProvider(c.Adapter)
-		session.SetSystem(prompt.System(env, p.SystemPromptAppend))
+		session.SetSystem(prompt.System(env, systemExtra(p.SystemPromptAppend)))
 		session.SetMaxTokens(p.MaxOutputTokens)
 		level, _ := effort.Parse(p.ReasoningEffort)
 		session.SetEffort(level)
@@ -404,6 +423,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
+	updateSystem := func() {
+		session.SetSystem(prompt.System(env, systemExtra(active.Provider.SystemPromptAppend)))
+	}
+
 	return ui.Chat(ui.ChatOptions{
 		Session:      session,
 		MCP:          mcpManager,
@@ -432,6 +455,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		AutoCompact:    conn.AutoCompact,
 		History:        loadHistory(historyPath(path)),
 		SaveHistory:    saveHistory(historyPath(path), redactor.String),
+		Skills:         skillSet,
+		UpdateSystem:   updateSystem,
 		Status: ui.StatusInfo{
 			Provider:      name,
 			Model:         conn.Provider.Model,
